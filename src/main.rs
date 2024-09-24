@@ -17,6 +17,7 @@ use embedded_can::{ExtendedId, Id, StandardId};
 use heapless::Vec;
 use mcp25xxfd::frame::Frame;
 use mcp25xxfd::{config::{BitRate, Clock, Config, FIFOConfig, FilterConfig, MaskConfig}, registers, MCP25xxFD};
+use serde::{Deserialize, Serialize};
 use static_cell::StaticCell;
 
 use {defmt_rtt as _, panic_probe as _};
@@ -28,14 +29,16 @@ static BATTERY_SIGNAL: Signal<CriticalSectionRawMutex, BatteryData> = Signal::ne
 
 const BATTERY_ADDRESS: u16 = 0x7E4;
 const BATTERY_QUERY: [u8; 8] = [0x03, 0x22, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00];
+
+#[derive(Serialize, Deserialize, Format)]
 struct BatteryData {
-    bms_soc: f32,
+    bms_soc: u8,
     bms_relay: bool,
-    battery_current: f32,
-    battery_voltage: f32,
-    aux_battery_voltage: f32,
+    battery_current: i16,
+    battery_voltage: u16,
+    aux_battery_voltage: u8,
     available_power: u16,
-    charge_current_request: f32,
+    charge_current_request: u16,
 }
 
 #[embassy_executor::main]
@@ -173,18 +176,18 @@ async fn obd_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0
             addr => warn!("Unhandled ISO-TP response from address {:x}", addr),
         }
 
-        Timer::after_millis(5000).await;
+        Timer::after_millis(1000).await;
     }
 
     fn process_battery_data(data: &[u8]) {
         let data = BatteryData {
-            bms_soc: data[4] as f32 / 2.0,
+            bms_soc: data[4],
             bms_relay: data[9] > 0,
-            battery_current: i16::from_be_bytes(data[10..12].try_into().unwrap()) as f32 / 10.0,
-            battery_voltage: u16::from_be_bytes(data[12..14].try_into().unwrap()) as f32 / 10.0,
-            aux_battery_voltage: data[29] as f32 / 10.0,
+            battery_current: i16::from_be_bytes(data[10..12].try_into().unwrap()),
+            battery_voltage: u16::from_be_bytes(data[12..14].try_into().unwrap()),
+            aux_battery_voltage: data[29],
             available_power: u16::from_be_bytes(data[5..7].try_into().unwrap()),
-            charge_current_request: u16::from_be_bytes(data[7..9].try_into().unwrap()) as f32 / 10.0,
+            charge_current_request: u16::from_be_bytes(data[7..9].try_into().unwrap()),
         };
         BATTERY_SIGNAL.signal(data);
     }
@@ -225,8 +228,9 @@ async fn comma_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SP
         info!("\nSOC: {}%\nRelay: {}\nBattery Current: {} A\nBattery Voltage: {} V\nAux Battery Voltage: {} V\nAvailable Power: {} kW\nCharge Current Request: {} A",
         battery_data.bms_soc, battery_data.bms_relay, battery_data.battery_current, battery_data.battery_voltage, battery_data.aux_battery_voltage, battery_data.available_power, battery_data.charge_current_request);
 
-        let data = &[battery_data.bms_soc as u8 * 2, battery_data.bms_soc as u8 * 2, battery_data.bms_soc as u8 * 2, battery_data.bms_soc as u8 * 2, battery_data.bms_soc as u8 * 2, battery_data.bms_soc as u8 * 2, battery_data.bms_soc as u8 * 2, battery_data.bms_soc as u8 * 2];
-        let battery_query_frame = Frame::new(StandardId::new(0x715).unwrap(), data).unwrap();
+        let data: Vec<u8, 64> = postcard::to_vec(&battery_data).unwrap();
+        debug!("Serialized length is: {}", data.len());
+        let battery_query_frame = Frame::new(StandardId::new(0x715).unwrap(), data.as_slice()).unwrap();
 
         comma_controller.transmit::<TRANSMIT_FIFO>(&battery_query_frame).await.unwrap();
     }
