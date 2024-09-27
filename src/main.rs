@@ -17,6 +17,7 @@ use embedded_can::{ExtendedId, Id, StandardId};
 use heapless::Vec;
 use mcp25xxfd::frame::Frame;
 use mcp25xxfd::{config::{BitRate, Clock, Config, FIFOConfig, FilterConfig, MaskConfig}, registers, MCP25xxFD};
+use mcp25xxfd::registers::PayloadSize;
 use static_cell::StaticCell;
 
 use {defmt_rtt as _, panic_probe as _};
@@ -25,6 +26,8 @@ type SPI0Type<BUS> = Spi<'static, BUS, spi::Async>;
 static SPI_BUS0: StaticCell<Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>> = StaticCell::new();
 
 static FORWARDING_CHANNEL: Channel<CriticalSectionRawMutex, obd_data::Data, 10> = Channel::new();
+
+static OBD_CONTROLLER: StaticCell<Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<CriticalSectionRawMutex, SPI0Type<SPI0>, Output>>>> = StaticCell::new();
 
 fn construct_uds_query(command: &[u8]) -> [u8; 8] {
     let mut query = [0u8; 8];
@@ -38,11 +41,28 @@ fn construct_uds_query(command: &[u8]) -> [u8; 8] {
     }
     query
 }
-fn ecu_rx_address(ecu_addr: impl Into<Id>) -> Id {
-    let ecu_addr = ecu_addr.into();
-    match ecu_addr {
-        Id::Standard(addr) => StandardId::new(addr.as_raw() + 8).unwrap().into(),
-        Id::Extended(addr) => ExtendedId::new(addr.as_raw() + 8).unwrap().into(),
+struct ECUAddresses {
+    bms: Id,
+    tpms: Id,
+}
+impl ECUAddresses {
+    fn new() -> (Self, Self) {
+        let tx = Self {
+            bms: StandardId::new(0x7E4).unwrap().into(),
+            tpms: StandardId::new(0x7A0).unwrap().into(),
+        };
+        let rx = Self {
+            bms: Self::rx_address(tx.bms),
+            tpms: Self::rx_address(tx.tpms),
+        };
+        (tx, rx)
+    }
+    fn rx_address(ecu_addr: impl Into<Id>) -> Id {
+        let ecu_addr = ecu_addr.into();
+        match ecu_addr {
+            Id::Standard(addr) => StandardId::new(addr.as_raw() + 8).unwrap().into(),
+            Id::Extended(addr) => ExtendedId::new(addr.as_raw() + 8).unwrap().into(),
+        }
     }
 }
 
@@ -97,10 +117,22 @@ mod obd_data {
         pub dc_battery_module_temp4: i8,
         pub dc_battery_module_temp5: i8,
     }
+    #[derive(Serialize, Deserialize, Format)]
+    pub struct TirePressures {
+        pub front_left_psi: u8,
+        pub front_left_temp: u8, // Subtract 55 degrees C
+        pub front_right_psi: u8,
+        pub front_right_temp: u8,
+        pub rear_left_psi: u8,
+        pub rear_left_temp: u8,
+        pub rear_right_psi: u8,
+        pub rear_right_temp: u8,
+    }
 
     #[derive(Serialize, Deserialize, Format)]
     pub enum Data {
         BatteryData1(BatteryData1),
+        TirePressures(TirePressures),
         CabinEnvironmentData(()), // TODO
         Error(&'static str),
     }
@@ -139,78 +171,84 @@ async fn main(spawner: Spawner) {
     let mut bme280 = BME280::new_primary(i2c);
     bme280.init(&mut Delay).unwrap();
 
-    spawner.must_spawn(obd_task(spi0, obd_cs, obd_int));
+    spawner.must_spawn(obd_task(spawner, spi0, obd_cs, obd_int));
     spawner.must_spawn(comma_task(spi0, comma_cs, comma_int));
 }
 
-#[embassy_executor::task]
-async fn obd_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>, cs: Output<'static>, int: Input<'static>) {
-    const TRANSMIT_FIFO: u8 = 1;
-    const RECEIVE_FIFO: u8 = 2;
+const TRANSMIT_FIFO: u8 = 1;
+const RX_BATTERY_FIFO: u8 = 2;
+const RX_TPMS_FIFO: u8 = 3;
 
-    let battery_address = StandardId::new(0x7E4).unwrap();
-    let tpms_address = StandardId::new(0x7A0).unwrap();
+#[embassy_executor::task]
+async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>, cs: Output<'static>, mut int: Input<'static>) {
+
+    let (tx_addrs, rx_addrs) = ECUAddresses::new();
 
     let obd_device = SpiDevice::new(spi_bus, cs);
-    let mut obd_controller = MCP25xxFD::new(obd_device, int);
+    let obd_controller = OBD_CONTROLLER.init(Mutex::new(MCP25xxFD::new(obd_device)));
 
-    obd_controller.reset_and_apply_config(&Config {
-        clock: Clock::Clock20MHz,
-        bit_rate: BitRate::default(),
-        ecc_enabled: true,
-        restrict_retx_attempts: false,
-        txq_enabled: false,
-        tx_event_fifo_enabled: false,
-        iso_crc_enabled: true,
-    }).await.unwrap();
+    {
+        let mut obd_controller = obd_controller.lock().await;
+        obd_controller.reset_and_apply_config(&Config {
+            clock: Clock::Clock20MHz,
+            bit_rate: BitRate::default(),
+            ecc_enabled: true,
+            restrict_retx_attempts: false,
+            txq_enabled: false,
+            tx_event_fifo_enabled: false,
+            iso_crc_enabled: true,
+        }).await.unwrap();
 
-    obd_controller.configure_fifo(FIFOConfig::<TRANSMIT_FIFO> {
-        transmit: true,
-        size: 8,
-        payload_size: registers::PayloadSize::Bytes8,
-        priority: 1,
-        tx_attempts: registers::RetransmissionAttempts::Unlimited1,
-    }).await.unwrap();
-    obd_controller.configure_fifo(FIFOConfig::<RECEIVE_FIFO> {
-        transmit: false,
-        size: 16,
-        payload_size: registers::PayloadSize::Bytes8,
-        priority: 0,
-        tx_attempts: registers::RetransmissionAttempts::Unlimited1,
-    }).await.unwrap();
+        obd_controller.configure_fifo(
+            FIFOConfig::<TRANSMIT_FIFO>::tx_with_size(8, PayloadSize::Bytes8)
+        ).await.unwrap();
 
-    obd_controller.configure_filter(
-        FilterConfig::<0, RECEIVE_FIFO>::from_id(ecu_rx_address(battery_address)),
-        MaskConfig::<0>::from_id(StandardId::MAX), // Match filter address exactly
-    ).await.unwrap();
+        obd_controller.configure_fifo(
+            FIFOConfig::<RX_BATTERY_FIFO>::rx_with_size(16, PayloadSize::Bytes8)
+        ).await.unwrap();
+        obd_controller.configure_filter(
+            FilterConfig::<RX_BATTERY_FIFO, RX_BATTERY_FIFO>::from_id(rx_addrs.bms),
+            MaskConfig::<RX_BATTERY_FIFO>::match_exact(),
+        ).await.unwrap();
 
-    obd_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
-    Timer::after_millis(500).await;
+        obd_controller.configure_fifo(
+            FIFOConfig::<RX_TPMS_FIFO>::rx_with_size(16, PayloadSize::Bytes8)
+        ).await.unwrap();
+        obd_controller.configure_filter(
+            FilterConfig::<RX_TPMS_FIFO, RX_TPMS_FIFO>::from_id(rx_addrs.tpms),
+            MaskConfig::<RX_TPMS_FIFO>::match_exact(),
+        ).await.unwrap();
 
-    let queries = [
-        Frame::new(battery_address, &construct_uds_query(&[0x01, 0x01])).unwrap(),
-        Frame::new(tpms_address, &construct_uds_query(&[0x22, 0xC0, 0x0B])).unwrap(),
-    ];
+        obd_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
+        Timer::after_millis(500).await;
+    }
+    spawner.must_spawn(obd_sender_task(obd_controller, tx_addrs));
 
-    let mut iso_tp_data: Vec<u8, 64> = Vec::new();
-    let mut iso_tp_length: Option<u16> = None;
+    // Receive loop
     loop {
-        obd_controller.transmit::<TRANSMIT_FIFO>(&queries[0]).await.unwrap();
-        obd_controller.transmit::<TRANSMIT_FIFO>(&queries[1]).await.unwrap();
+        // Wait for interrupt pin to go low (aka active) before calling receive so we don't spinlock
+        int.wait_for_low().await;
+        // Receive query responses
+        let mut iso_tp_data: Vec<u8, 64> = Vec::new();
+        let mut iso_tp_length: Option<u16> = None;
+        let mut current_fifo: Option<u8> = None;
 
-        let (id, data) = loop {
-            match obd_controller.receive().await {
-                Ok(frame) => {
-                    debug!("Received message from: {:x} ({} bytes): {:x}", frame.raw_id(), frame.data().len(), frame.data());
+        let (id, pid, data) = loop {
+            let rx_result = {
+                obd_controller.lock().await.receive(current_fifo).await
+            };
+            match rx_result {
+                Ok((fifo, frame)) => {
+                    current_fifo = Some(fifo);
+                    debug!("Received message from FIFO{}: {:x} ({} bytes): {:x}", fifo, frame.raw_id(), frame.data().len(), frame.data());
 
                     match frame.data()[0] >> 4 {
                         0 => {
                             // Single ISO-TP frame
                             debug!("Single frame of data");
-                            iso_tp_length = None;
-                            iso_tp_data.clear();
+                            // ISO-TP transmission complete
                             iso_tp_data.extend_from_slice(&frame.data()[1..]).unwrap();
-                            break (frame, &iso_tp_data[3..]); // Strip 0x62 (UDS response) + PID (2 bytes) from data
+                            break (frame, &iso_tp_data[1..3], &iso_tp_data[3..]); // Strip 0x62 (UDS response) + PID (2 bytes) from data
                         },
                         1 => {
                             // First ISO-TP frame
@@ -226,7 +264,10 @@ async fn obd_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0
                                 Id::Extended(id) => ExtendedId::new(id.as_raw() - 8).unwrap().into(),
                             };
                             let flow_control_frame = Frame::new(tx_id, &[0x30, 0x00, 10, 0x00, 0x00, 0x00, 0x00, 0x00]).unwrap();
-                            obd_controller.transmit::<TRANSMIT_FIFO>(&flow_control_frame).await.unwrap();
+                            obd_controller
+                                .lock().await
+                                .transmit::<TRANSMIT_FIFO>(&flow_control_frame).await
+                                .unwrap();
                         },
                         2 => {
                             // Consecutive ISO-TP frame
@@ -236,8 +277,7 @@ async fn obd_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0
 
                             if iso_tp_data.len() as u16 >= iso_tp_length.unwrap_or(u16::MAX) {
                                 // ISO-TP transmission complete
-                                iso_tp_length = None;
-                                break (frame, &iso_tp_data[3..]); // Strip 0x62 (UDS response) + PID (2 bytes) from data
+                                break (frame, &iso_tp_data[1..3], &iso_tp_data[3..]); // Strip 0x62 (UDS response) + PID (2 bytes) from data
                             }
                         },
                         _ => {},
@@ -250,16 +290,21 @@ async fn obd_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0
             }
         };
 
-        match id {
-            frame if frame.id() == ecu_rx_address(battery_address) => process_battery_data(data).await,
-            frame => warn!("Unhandled ISO-TP response from address {:x}", frame.raw_id()),
+        let data = match id {
+            frame if frame.id() == rx_addrs.bms => Some(process_battery_data(data)),
+            frame if frame.id() == rx_addrs.tpms => Some(process_tpms_data(data)),
+            frame => {
+                warn!("Unhandled ISO-TP response from address {:x} to PID {:x}: {:x}", frame.raw_id(), pid, data);
+                None
+            },
+        };
+        if let Some(data) = data {
+            FORWARDING_CHANNEL.send(data).await;
         }
-
-        Timer::after_millis(1000).await;
     }
 
-    async fn process_battery_data(data: &[u8]) {
-        let data = obd_data::BatteryData1 {
+    fn process_battery_data(data: &[u8]) -> obd_data::Data {
+        obd_data::Data::BatteryData1(obd_data::BatteryData1 {
             charging:
                 if data[9] & 0x20 > 0 { obd_data::ChargingType::AC }
                 else if data[9] & 0x40 > 0 { obd_data::ChargingType::DC }
@@ -294,17 +339,48 @@ async fn obd_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0
             dc_battery_module_temp3: data[18] as i8,
             dc_battery_module_temp4: data[19] as i8,
             dc_battery_module_temp5: data[20].try_into().unwrap(), // TODO: same as inlet temp???
-        };
-        FORWARDING_CHANNEL.send(obd_data::Data::BatteryData1(data)).await;
+        })
+    }
+
+    fn process_tpms_data(data: &[u8]) -> obd_data::Data {
+        obd_data::Data::TirePressures(obd_data::TirePressures {
+            front_left_psi: data[4],
+            front_left_temp: data[5],
+            front_right_psi: data[9],
+            front_right_temp: data[10],
+            rear_left_psi: data[14],
+            rear_left_temp: data[15],
+            rear_right_psi: data[19],
+            rear_right_temp: data[20],
+        })
     }
 }
 
 #[embassy_executor::task]
-async fn comma_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>, cs: Output<'static>, int: Input<'static>) {
-    const TRANSMIT_FIFO: u8 = 1;
+async fn obd_sender_task(obd_controller: &'static Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<'_, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'_>>>>, tx_addrs: ECUAddresses) {
+    let queries = [
+        Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x01])).unwrap(),
+        // Frame::new(tx_addrs.tpms, &construct_uds_query(&[0xC0, 0x02])).unwrap(),
+        Frame::new(tx_addrs.tpms, &construct_uds_query(&[0xC0, 0x0B])).unwrap(),
+    ];
 
+    loop {
+        // Send all queries once per second
+        for frame in queries.iter() {
+            obd_controller
+                .lock().await
+                .transmit::<TRANSMIT_FIFO>(frame).await
+                .unwrap();
+        }
+
+        Timer::after_millis(1000).await;
+    }
+}
+
+#[embassy_executor::task]
+async fn comma_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>, cs: Output<'static>, _int: Input<'static>) {
     let comma_device = SpiDevice::new(spi_bus, cs);
-    let mut comma_controller = MCP25xxFD::new(comma_device, int);
+    let mut comma_controller = MCP25xxFD::new(comma_device);
 
     comma_controller.reset_and_apply_config(&Config {
         clock: Clock::Clock20MHz,
@@ -316,26 +392,21 @@ async fn comma_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SP
         iso_crc_enabled: true,
     }).await.unwrap();
 
-    comma_controller.configure_fifo(FIFOConfig::<TRANSMIT_FIFO> {
-        transmit: true,
-        size: 8,
-        payload_size: registers::PayloadSize::Bytes64,
-        priority: 1,
-        tx_attempts: registers::RetransmissionAttempts::Unlimited1,
-    }).await.unwrap();
+    comma_controller.configure_fifo(
+        FIFOConfig::<TRANSMIT_FIFO>::tx_with_size(8, PayloadSize::Bytes64)
+    ).await.unwrap();
 
     comma_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
-
     Timer::after_millis(500).await;
 
     loop {
         let forward_data = FORWARDING_CHANNEL.receive().await;
 
         let data: Vec<u8, 64> = postcard::to_vec(&forward_data).unwrap();
-        debug!("Serialized length is: {}", data.len());
         debug!("{:?}", &forward_data);
-        let battery_query_frame = Frame::new(StandardId::new(0x715).unwrap(), data.as_slice()).unwrap();
+        debug!("Serialized length is: {}", data.len());
 
-        comma_controller.transmit::<TRANSMIT_FIFO>(&battery_query_frame).await.unwrap();
+        let forward_frame = Frame::new(StandardId::new(0x715).unwrap(), data.as_slice()).unwrap();
+        comma_controller.transmit::<TRANSMIT_FIFO>(&forward_frame).await.unwrap();
     }
 }
