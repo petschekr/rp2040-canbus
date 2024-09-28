@@ -36,11 +36,9 @@ static_cell = "2"
 portable-atomic = { version = "1.5", features = ["critical-section"] }
 heapless = "0.7"
 embedded-can = "0.4"
-postcard = "1"
-serde = { version = "1", features = ["derive"], default-features = false }
 
 mcp25xxfd = { path = "/home/petschekr/Documents/Software/mcp25xxFD" }
-bme280 = {  version = "0.5.1", features = ["defmt"] }
+bme280-rs = { version = "0.3.0", features = ["async"] }
 
 # cargo build/run
 [profile.dev]
