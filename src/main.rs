@@ -173,22 +173,49 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
     }
     spawner.must_spawn(obd_sender_task(obd_controller, tx_addrs));
 
+    struct ISOTPTransfer {
+        rx_addr: Id,
+        raw_data: Vec<u8, 64>,
+        length: u16,
+        rx_fifo: u8,
+    }
+    impl ISOTPTransfer {
+        fn new(rx_addr: Id, data: &[u8], length: u16, rx_fifo: u8) -> Self {
+            Self {
+                rx_addr,
+                raw_data: Vec::from_slice(data).unwrap(),
+                length,
+                rx_fifo,
+            }
+        }
+        fn pid(&self) -> &[u8] {
+            // First byte is UDS response type
+            // Next two bytes are requested PID
+            &self.raw_data[1..3]
+        }
+        fn data(&self) -> &[u8] {
+            &self.raw_data[3..]
+        }
+        fn raw_rx_addr(&self) -> u32 {
+            match self.rx_addr {
+                Id::Standard(id) => id.as_raw() as u32,
+                Id::Extended(id) => id.as_raw(),
+            }
+        }
+    }
+
     // Receive loop
     loop {
         // Wait for interrupt pin to go low (aka active) before calling receive so we don't spinlock
         int.wait_for_low().await;
-        // Receive query responses
-        let mut iso_tp_data: Vec<u8, 64> = Vec::new();
-        let mut iso_tp_length: Option<u16> = None;
-        let mut current_fifo: Option<u8> = None;
+        // Lock the mutex for this receive cycle (sender thread must wait until we're done receiving)
+        let mut obd_controller = obd_controller.lock().await;
+        let mut transfer: Option<ISOTPTransfer> = None;
 
-        let (frame, pid, data) = loop {
-            // Temp variable required to not hold lock across a different await point
-            let rx_result = obd_controller.lock().await.receive(current_fifo).await;
-
-            match rx_result {
+        loop {
+            let rx_fifo = transfer.as_ref().map(|t| t.rx_fifo); // Hold the RX FIFO number if there is an active transfer
+            match obd_controller.receive(rx_fifo).await {
                 Ok(Some((fifo, frame))) => {
-                    current_fifo = Some(fifo);
                     trace!("Received message from FIFO{}: {:x} ({} bytes): {:x}", fifo, frame.raw_id(), frame.data().len(), frame.data());
 
                     match frame.data()[0] >> 4 {
@@ -196,60 +223,66 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
                             // Single ISO-TP frame
                             trace!("Single frame of data");
                             // ISO-TP transmission complete
-                            iso_tp_data.extend_from_slice(&frame.data()[1..]).unwrap();
-                            break (frame, &iso_tp_data[1..3], &iso_tp_data[3..]); // Strip 0x62 (UDS response) + PID (2 bytes) from data
+                            transfer = Some(ISOTPTransfer::new(frame.id(),&frame.data()[1..], 8 - 3, fifo));
+                            break;
                         },
                         1 => {
                             // First ISO-TP frame
                             let length = frame.data()[1] as u16 + ((frame.data()[0] as u16 & 0b1111) << 8);
                             trace!("First frame of data with total length {}", length);
-                            iso_tp_length = Some(length);
-                            iso_tp_data.clear();
-                            iso_tp_data.extend_from_slice(&frame.data()[2..]).unwrap();
+                            transfer = Some(ISOTPTransfer::new(frame.id(), &frame.data()[2..], length, fifo));
 
-                            // Send flow control message
+                            // Send flow control message to receive the rest of the data
                             let flow_control_frame = Frame::new(ECUAddresses::tx_address(frame.id()), &[0x30, 0x00, 10, 0x00, 0x00, 0x00, 0x00, 0x00]).unwrap();
-                            obd_controller
-                                .lock().await
-                                .transmit::<TRANSMIT_FIFO>(&flow_control_frame).await
-                                .unwrap();
+                            obd_controller.transmit::<TRANSMIT_FIFO>(&flow_control_frame).await.unwrap();
                         },
                         2 => {
                             // Consecutive ISO-TP frame
                             let frame_number = frame.data()[0] & 0b1111;
                             trace!("Consecutive frame #{}", frame_number);
-                            iso_tp_data.extend_from_slice(&frame.data()[1..]).unwrap();
 
-                            if iso_tp_data.len() as u16 >= iso_tp_length.unwrap_or(u16::MAX) {
-                                // ISO-TP transmission complete
-                                break (frame, &iso_tp_data[1..3], &iso_tp_data[3..]); // Strip 0x62 (UDS response) + PID (2 bytes) from data
+                            match transfer {
+                                Some(ref mut transfer) => {
+                                    transfer.raw_data.extend_from_slice(&frame.data()[1..]).unwrap();
+                                    if transfer.raw_data.len() as u16 >= transfer.length {
+                                        // ISO-TP transmission complete
+                                        break;
+                                    }
+                                },
+                                None => warn!("Received consecutive frame without an active transfer!"),
                             }
                         },
                         _ => {},
                     }
                 },
                 Ok(None) => {
+                    // No message in the specified RX FIFO so wait for another RX interrupt before continuing
                     int.wait_for_low().await
                 },
                 Err(mcp25xxfd::Error::ControllerError(description)) => {
                     error!("{}", description);
                     FORWARDING_CHANNEL.send((StandardId::new(0x700).unwrap(), Vec::from_slice(description.as_bytes()).unwrap())).await;
+                    break;
                 },
-                Err(err) => { dbg!(err); },
+                Err(err) => {
+                    dbg!(err);
+                    break;
+                },
             }
         };
 
-        // rx_addrs
-        let forwarding_address = match frame.id() {
-            addr if addr == rx_addrs.bms => { StandardId::new(0x701).unwrap() },
-            addr if addr == rx_addrs.tpms => { StandardId::new(0x702).unwrap() },
-            addr if addr == rx_addrs.hvac => { StandardId::new(0x703).unwrap() },
-            _ => {
-                warn!("Unhandled ISO-TP response from address {:x} to PID {:x}: {:x}", frame.raw_id(), pid, data);
-                continue;
-            },
-        };
-        FORWARDING_CHANNEL.send((forwarding_address, Vec::from_slice(&data).unwrap())).await;
+        if let Some(transfer) = transfer {
+            let forwarding_address = match transfer.rx_addr {
+                addr if addr == rx_addrs.bms => { StandardId::new(0x701).unwrap() },
+                addr if addr == rx_addrs.tpms => { StandardId::new(0x702).unwrap() },
+                addr if addr == rx_addrs.hvac => { StandardId::new(0x703).unwrap() },
+                _ => {
+                    warn!("Unhandled ISO-TP response from address {:x} to PID {:x}: {:x}", transfer.raw_rx_addr(), transfer.pid(), transfer.data());
+                    continue;
+                },
+            };
+            FORWARDING_CHANNEL.send((forwarding_address, Vec::from_slice(transfer.data()).unwrap())).await;
+        }
     }
 }
 
@@ -272,7 +305,6 @@ async fn obd_sender_task(obd_controller: &'static Mutex<CriticalSectionRawMutex,
                 .unwrap();
             Timer::after_millis(10).await;
         }
-
         Timer::after_millis(1000).await;
     }
 }
@@ -291,9 +323,8 @@ async fn bme_sender_task(i2c: i2c::I2c<'static, I2C0, i2c::Async>) {
             .with_filter(bme280_rs::Filter::Filter4)
     ).await.unwrap();
 
-    let mut forward_data: Vec<u8, 64> = Vec::new();
     loop {
-        forward_data.clear();
+        let mut forward_data: Vec<u8, 64> = Vec::new();
 
         let sample = bme280.read_sample().await.unwrap();
         let pressure = sample.pressure.unwrap_or(0.0).to_be_bytes();
@@ -303,7 +334,7 @@ async fn bme_sender_task(i2c: i2c::I2c<'static, I2C0, i2c::Async>) {
         forward_data.extend_from_slice(&pressure).unwrap();
         forward_data.extend_from_slice(&temperature).unwrap();
         forward_data.extend_from_slice(&humidity).unwrap();
-        FORWARDING_CHANNEL.send((StandardId::new(0x720).unwrap(), forward_data.clone())).await;
+        FORWARDING_CHANNEL.send((StandardId::new(0x720).unwrap(), forward_data)).await;
 
         Timer::after_millis(1000).await;
     }
