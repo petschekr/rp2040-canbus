@@ -12,7 +12,7 @@ use embassy_rp::spi::{self, Spi};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Delay, Timer};
+use embassy_time::{Delay, Timer, Duration, Ticker, Instant};
 use embedded_can::{ExtendedId, Id, StandardId};
 use heapless::Vec;
 use mcp25xxfd::frame::Frame;
@@ -211,6 +211,7 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
         // Lock the mutex for this receive cycle (sender thread must wait until we're done receiving)
         let mut obd_controller = obd_controller.lock().await;
         let mut transfer: Option<ISOTPTransfer> = None;
+        let transfer_start = Instant::now();
 
         loop {
             let rx_fifo = transfer.as_ref().map(|t| t.rx_fifo); // Hold the RX FIFO number if there is an active transfer
@@ -256,8 +257,8 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
                     }
                 },
                 Ok(None) => {
-                    // No message in the specified RX FIFO so wait for another RX interrupt before continuing
-                    int.wait_for_low().await
+                    // No message in the specified RX FIFO, wait for another RX interrupt before continuing (but not more than 250 ms)
+                    let _ = embassy_time::with_timeout(Duration::from_millis(250), int.wait_for_low()).await;
                 },
                 Err(mcp25xxfd::Error::ControllerError(description)) => {
                     error!("{}", description);
@@ -268,6 +269,12 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
                     dbg!(err);
                     break;
                 },
+            }
+            // If we've been receiving for more than 250 milliseconds, abort so that we don't hold the mutex lock forever
+            if transfer_start.elapsed().as_millis() > 250 {
+                warn!("Transfer from {:x} timed out", transfer.map(|t| t.raw_rx_addr()).unwrap_or(0));
+                transfer = None;
+                break;
             }
         };
 
@@ -296,6 +303,7 @@ async fn obd_sender_task(obd_controller: &'static Mutex<CriticalSectionRawMutex,
         Frame::new(tx_addrs.hvac, &construct_uds_query(&[0x01, 0x00])).unwrap(),
     ];
 
+    let mut ticker = Ticker::every(Duration::from_millis(1000));
     loop {
         // Send all queries once per second
         for frame in queries.iter() {
@@ -305,7 +313,7 @@ async fn obd_sender_task(obd_controller: &'static Mutex<CriticalSectionRawMutex,
                 .unwrap();
             Timer::after_millis(10).await;
         }
-        Timer::after_millis(1000).await;
+        ticker.next().await;
     }
 }
 
