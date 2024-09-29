@@ -34,10 +34,10 @@ embassy-embedded-hal = "0.2"
 embassy-sync = "0.6"
 static_cell = "2"
 portable-atomic = { version = "1.5", features = ["critical-section"] }
-heapless = "0.7"
-embedded-can = "0.4"
+heapless = { version = "0.8", features = ["defmt-03"] }
+embedded-can = { git = "https://github.com/rust-embedded/embedded-hal.git", features = ["defmt-03"]}
 
-mcp25xxfd = { path = "/home/petschekr/Documents/Software/mcp25xxFD" }
+mcp25xxfd = { path = "/home/petschekr/Documents/Software/mcp25xxFD", features = ["defmt"] }
 bme280-rs = { version = "0.3.0", features = ["async"] }
 
 # cargo build/run

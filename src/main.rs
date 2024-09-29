@@ -49,6 +49,9 @@ struct ECUAddresses {
     bms: Id,
     tpms: Id,
     hvac: Id,
+    adas: Id,
+    iccu: Id,
+    vcms: Id,
 }
 impl ECUAddresses {
     fn new() -> (Self, Self) {
@@ -56,11 +59,17 @@ impl ECUAddresses {
             bms: StandardId::new(0x7E4).unwrap().into(),
             tpms: StandardId::new(0x7A0).unwrap().into(),
             hvac: StandardId::new(0x7B3).unwrap().into(),
+            adas: StandardId::new(0x730).unwrap().into(),
+            iccu: StandardId::new(0x7E5).unwrap().into(),
+            vcms: StandardId::new(0x744).unwrap().into(),
         };
         let rx = Self {
             bms: Self::rx_address(tx.bms),
             tpms: Self::rx_address(tx.tpms),
             hvac: Self::rx_address(tx.hvac),
+            adas: Self::rx_address(tx.adas),
+            iccu: Self::rx_address(tx.iccu),
+            vcms: Self::rx_address(tx.vcms),
         };
         (tx, rx)
     }
@@ -119,6 +128,9 @@ const TRANSMIT_FIFO: u8 = 1;
 const RX_BATTERY_FIFO: u8 = 2;
 const RX_TPMS_FIFO: u8 = 3;
 const RX_HVAC_FIFO: u8 = 4;
+const RX_ADAS_FIFO: u8 = 5;
+const RX_ICCU_FIFO: u8 = 6;
+const RX_VCMS_FIFO: u8 = 7;
 
 #[embassy_executor::task]
 async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>, cs: Output<'static>, mut int: Input<'static>) {
@@ -168,14 +180,39 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
             MaskConfig::<RX_HVAC_FIFO>::match_exact(),
         ).await.unwrap();
 
+        obd_controller.configure_fifo(
+            FIFOConfig::<RX_ADAS_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
+        ).await.unwrap();
+        obd_controller.configure_filter(
+            FilterConfig::<RX_ADAS_FIFO, RX_ADAS_FIFO>::from_id(rx_addrs.adas),
+            MaskConfig::<RX_ADAS_FIFO>::match_exact(),
+        ).await.unwrap();
+
+        obd_controller.configure_fifo(
+            FIFOConfig::<RX_ICCU_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
+        ).await.unwrap();
+        obd_controller.configure_filter(
+            FilterConfig::<RX_ICCU_FIFO, RX_ICCU_FIFO>::from_id(rx_addrs.iccu),
+            MaskConfig::<RX_ICCU_FIFO>::match_exact(),
+        ).await.unwrap();
+
+        obd_controller.configure_fifo(
+            FIFOConfig::<RX_VCMS_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
+        ).await.unwrap();
+        obd_controller.configure_filter(
+            FilterConfig::<RX_VCMS_FIFO, RX_VCMS_FIFO>::from_id(rx_addrs.vcms),
+            MaskConfig::<RX_VCMS_FIFO>::match_exact(),
+        ).await.unwrap();
+
         obd_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
         Timer::after_millis(500).await;
     }
     spawner.must_spawn(obd_sender_task(obd_controller, tx_addrs));
 
+    #[derive(Format)]
     struct ISOTPTransfer {
         rx_addr: Id,
-        raw_data: Vec<u8, 64>,
+        raw_data: Vec<u8, 80>,
         length: u16,
         rx_fifo: u8,
     }
@@ -231,10 +268,15 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
                             // First ISO-TP frame
                             let length = frame.data()[1] as u16 + ((frame.data()[0] as u16 & 0b1111) << 8);
                             trace!("First frame of data with total length {}", length);
+                            if length >= 80 {
+                                warn!("Unable to handle ISO-TP transmission with length {} (ECU: {:x}, PID: {:x})", length, frame.raw_id(), &frame.data());
+                                transfer = None;
+                                break;
+                            }
                             transfer = Some(ISOTPTransfer::new(frame.id(), &frame.data()[2..], length, fifo));
 
                             // Send flow control message to receive the rest of the data
-                            let flow_control_frame = Frame::new(ECUAddresses::tx_address(frame.id()), &[0x30, 0x00, 10, 0x00, 0x00, 0x00, 0x00, 0x00]).unwrap();
+                            let flow_control_frame = Frame::new(ECUAddresses::tx_address(frame.id()), &[0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).unwrap();
                             obd_controller.transmit::<TRANSMIT_FIFO>(&flow_control_frame).await.unwrap();
                         },
                         2 => {
@@ -244,7 +286,15 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
 
                             match transfer {
                                 Some(ref mut transfer) => {
-                                    transfer.raw_data.extend_from_slice(&frame.data()[1..]).unwrap();
+                                    let remaining_bytes: usize = transfer.length as usize - transfer.raw_data.len();
+                                    if remaining_bytes > 7 {
+                                        transfer.raw_data.extend_from_slice(&frame.data()[1..]).unwrap();
+                                    }
+                                    else {
+                                        // Don't copy more bytes than the transfer size
+                                        transfer.raw_data.extend_from_slice(&frame.data()[1..1 + remaining_bytes]).unwrap();
+                                    }
+
                                     if transfer.raw_data.len() as u16 >= transfer.length {
                                         // ISO-TP transmission complete
                                         break;
@@ -272,35 +322,69 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
             }
             // If we've been receiving for more than 250 milliseconds, abort so that we don't hold the mutex lock forever
             if transfer_start.elapsed().as_millis() > 250 {
-                warn!("Transfer from {:x} timed out", transfer.map(|t| t.raw_rx_addr()).unwrap_or(0));
+                if let Some(transfer) = transfer {
+                    warn!("Transfer from {:x} timed out: {:?}", transfer.raw_rx_addr(), transfer);
+                }
+                else {
+                    warn!("Unknown transfer timed out");
+                }
                 transfer = None;
                 break;
             }
         };
 
-        if let Some(transfer) = transfer {
+        if let Some(transfer) = transfer.take() {
             let forwarding_address = match transfer.rx_addr {
-                addr if addr == rx_addrs.bms => { StandardId::new(0x701).unwrap() },
-                addr if addr == rx_addrs.tpms => { StandardId::new(0x702).unwrap() },
-                addr if addr == rx_addrs.hvac => { StandardId::new(0x703).unwrap() },
+                addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x01] => 0x701,
+                addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x05] => 0x705,
+                addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x06] => 0x706,
+                addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x11] => 0x70B,
+                addr if addr == rx_addrs.tpms && transfer.pid() == [0xC0, 0x0B] => 0x710,
+                addr if addr == rx_addrs.hvac && transfer.pid() == [0x01, 0x00] => 0x720,
+                addr if addr == rx_addrs.adas && transfer.pid() == [0xF0, 0x10] => 0x730,
+                addr if addr == rx_addrs.iccu && transfer.pid() == [0xE0, 0x01] => 0x741,
+                addr if addr == rx_addrs.iccu && transfer.pid() == [0xE0, 0x02] => 0x742,
+                addr if addr == rx_addrs.iccu && transfer.pid() == [0xE0, 0x03] => 0x743,
+                addr if addr == rx_addrs.iccu && transfer.pid() == [0xE0, 0x11] => 0x74B,
+                addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x01] => 0x751,
+                addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x02] => 0x752,
+                addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x03] => 0x753,
+                addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x04] => 0x754,
                 _ => {
                     warn!("Unhandled ISO-TP response from address {:x} to PID {:x}: {:x}", transfer.raw_rx_addr(), transfer.pid(), transfer.data());
                     continue;
                 },
             };
-            FORWARDING_CHANNEL.send((forwarding_address, Vec::from_slice(transfer.data()).unwrap())).await;
+            let forwarding_address = StandardId::new(forwarding_address).unwrap();
+            FORWARDING_CHANNEL.send((forwarding_address, Vec::from_slice(
+                &transfer
+                    .data()
+                    .chunks(64)
+                    .next()
+                    .unwrap()
+            ).unwrap())).await;
         }
     }
 }
 
 #[embassy_executor::task]
 async fn obd_sender_task(obd_controller: &'static Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<'_, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'_>>>>, tx_addrs: ECUAddresses) {
-    // Frame::new(tx_addrs.tpms, &construct_uds_query(&[0xC0, 0x02])).unwrap(), // Tire IDs(?)
-
     let queries = [
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x01])).unwrap(),
+        Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x05])).unwrap(),
+        Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x06])).unwrap(),
+        Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x11])).unwrap(),
         Frame::new(tx_addrs.tpms, &construct_uds_query(&[0xC0, 0x0B])).unwrap(),
         Frame::new(tx_addrs.hvac, &construct_uds_query(&[0x01, 0x00])).unwrap(),
+        Frame::new(tx_addrs.adas, &construct_uds_query(&[0xF0, 0x10])).unwrap(),
+        Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x01])).unwrap(),
+        Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x02])).unwrap(),
+        Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
+        Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x11])).unwrap(),
+        Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x01])).unwrap(),
+        Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x02])).unwrap(),
+        Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
+        Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x04])).unwrap(),
     ];
 
     let mut ticker = Ticker::every(Duration::from_millis(1000));
@@ -311,7 +395,7 @@ async fn obd_sender_task(obd_controller: &'static Mutex<CriticalSectionRawMutex,
                 .lock().await
                 .transmit::<TRANSMIT_FIFO>(frame).await
                 .unwrap();
-            Timer::after_millis(10).await;
+            Timer::after_millis(30).await;
         }
         ticker.next().await;
     }
@@ -331,6 +415,7 @@ async fn bme_sender_task(i2c: i2c::I2c<'static, I2C0, i2c::Async>) {
             .with_filter(bme280_rs::Filter::Filter4)
     ).await.unwrap();
 
+    let mut ticker = Ticker::every(Duration::from_millis(1000));
     loop {
         let mut forward_data: Vec<u8, 64> = Vec::new();
 
@@ -342,9 +427,9 @@ async fn bme_sender_task(i2c: i2c::I2c<'static, I2C0, i2c::Async>) {
         forward_data.extend_from_slice(&pressure).unwrap();
         forward_data.extend_from_slice(&temperature).unwrap();
         forward_data.extend_from_slice(&humidity).unwrap();
-        FORWARDING_CHANNEL.send((StandardId::new(0x720).unwrap(), forward_data)).await;
+        FORWARDING_CHANNEL.send((StandardId::new(0x7A0).unwrap(), forward_data)).await;
 
-        Timer::after_millis(1000).await;
+        ticker.next().await;
     }
 }
 
@@ -372,10 +457,15 @@ async fn comma_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SP
 
     loop {
         let (forward_addr, forward_data) = FORWARDING_CHANNEL.receive().await;
+        let forward_frame = Frame::new(forward_addr, forward_data.as_slice()).unwrap();
 
         debug!("Forwarding {} bytes to address {:x}", forward_data.len(), forward_addr.as_raw());
 
-        let forward_frame = Frame::new(forward_addr, forward_data.as_slice()).unwrap();
-        comma_controller.transmit::<TRANSMIT_FIFO>(&forward_frame).await.unwrap();
+        match comma_controller.transmit::<TRANSMIT_FIFO>(&forward_frame).await {
+            Ok(()) => {},
+            Err(err) => {
+                error!("Forwarding error: {}", err);
+            }
+        }
     }
 }
