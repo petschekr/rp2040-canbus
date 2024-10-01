@@ -29,6 +29,8 @@ static FORWARDING_CHANNEL: Channel<CriticalSectionRawMutex, (StandardId, Vec<u8,
 
 static OBD_CONTROLLER: StaticCell<Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<CriticalSectionRawMutex, SPI0Type<SPI0>, Output>>>> = StaticCell::new();
 
+static IS_CAR_OFF: StaticCell<Mutex<CriticalSectionRawMutex, bool>> = StaticCell::new();
+
 embassy_rp::bind_interrupts!(struct Irqs {
     I2C0_IRQ => i2c::InterruptHandler<I2C0>;
 });
@@ -207,7 +209,8 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
         obd_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
         Timer::after_millis(500).await;
     }
-    spawner.must_spawn(obd_sender_task(obd_controller, tx_addrs));
+    let is_car_off = IS_CAR_OFF.init(Mutex::new(true));
+    spawner.must_spawn(obd_sender_task(obd_controller, tx_addrs, is_car_off));
 
     #[derive(Format)]
     struct ISOTPTransfer {
@@ -335,7 +338,11 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
 
         if let Some(transfer) = transfer.take() {
             let forwarding_address = match transfer.rx_addr {
-                addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x01] => 0x701,
+                addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x01] => {
+                    // Poll more frequently when the HV battery is connected (current > 0 amps)
+                    *is_car_off.lock().await = transfer.data()[10..12] == [0x00, 0x00];
+                    0x701
+                },
                 addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x05] => 0x705,
                 addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x06] => 0x706,
                 addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x11] => 0x70B,
@@ -368,7 +375,11 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
 }
 
 #[embassy_executor::task]
-async fn obd_sender_task(obd_controller: &'static Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<'_, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'_>>>>, tx_addrs: ECUAddresses) {
+async fn obd_sender_task(
+    obd_controller: &'static Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<'_, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'_>>>>,
+    tx_addrs: ECUAddresses,
+    is_car_off: &'static Mutex<CriticalSectionRawMutex, bool>,
+) {
     let queries = [
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x01])).unwrap(),
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x05])).unwrap(),
@@ -387,15 +398,18 @@ async fn obd_sender_task(obd_controller: &'static Mutex<CriticalSectionRawMutex,
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x04])).unwrap(),
     ];
 
-    let mut ticker = Ticker::every(Duration::from_millis(1000));
+    let mut ticker = Ticker::every(Duration::from_secs(1));
     loop {
-        // Send all queries once per second
         for frame in queries.iter() {
             obd_controller
                 .lock().await
                 .transmit::<TRANSMIT_FIFO>(frame).await
                 .unwrap();
             Timer::after_millis(30).await;
+        }
+        if *is_car_off.lock().await {
+            // Wait 1 + 4 = 5 seconds between car off polls
+            ticker.reset_after(Duration::from_secs(4));
         }
         ticker.next().await;
     }
@@ -408,14 +422,14 @@ async fn bme_sender_task(i2c: i2c::I2c<'static, I2C0, i2c::Async>) {
     bme280.set_sampling_configuration(
         bme280_rs::Configuration::default()
             .with_sensor_mode(bme280_rs::SensorMode::Normal)
-            .with_standby_time(bme280_rs::StandbyTime::Millis500)
+            .with_standby_time(bme280_rs::StandbyTime::Millis1000)
             .with_pressure_oversampling(bme280_rs::Oversampling::Oversample8)
             .with_temperature_oversampling(bme280_rs::Oversampling::Oversample8)
             .with_humidity_oversampling(bme280_rs::Oversampling::Oversample8)
             .with_filter(bme280_rs::Filter::Filter4)
     ).await.unwrap();
 
-    let mut ticker = Ticker::every(Duration::from_millis(1000));
+    let mut ticker = Ticker::every(Duration::from_secs(30));
     loop {
         let mut forward_data: Vec<u8, 64> = Vec::new();
 
