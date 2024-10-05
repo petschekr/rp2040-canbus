@@ -54,6 +54,7 @@ struct ECUAddresses {
     adas: Id,
     iccu: Id,
     vcms: Id,
+    dash: Id,
 }
 impl ECUAddresses {
     fn new() -> (Self, Self) {
@@ -64,6 +65,7 @@ impl ECUAddresses {
             adas: StandardId::new(0x730).unwrap().into(),
             iccu: StandardId::new(0x7E5).unwrap().into(),
             vcms: StandardId::new(0x744).unwrap().into(),
+            dash: StandardId::new(0x7C6).unwrap().into(),
         };
         let rx = Self {
             bms: Self::rx_address(tx.bms),
@@ -72,6 +74,7 @@ impl ECUAddresses {
             adas: Self::rx_address(tx.adas),
             iccu: Self::rx_address(tx.iccu),
             vcms: Self::rx_address(tx.vcms),
+            dash: Self::rx_address(tx.dash),
         };
         (tx, rx)
     }
@@ -133,6 +136,7 @@ const RX_HVAC_FIFO: u8 = 4;
 const RX_ADAS_FIFO: u8 = 5;
 const RX_ICCU_FIFO: u8 = 6;
 const RX_VCMS_FIFO: u8 = 7;
+const RX_DASH_FIFO: u8 = 8;
 
 #[embassy_executor::task]
 async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>, cs: Output<'static>, mut int: Input<'static>) {
@@ -204,6 +208,14 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
         obd_controller.configure_filter(
             FilterConfig::<RX_VCMS_FIFO, RX_VCMS_FIFO>::from_id(rx_addrs.vcms),
             MaskConfig::<RX_VCMS_FIFO>::match_exact(),
+        ).await.unwrap();
+
+        obd_controller.configure_fifo(
+            FIFOConfig::<RX_DASH_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
+        ).await.unwrap();
+        obd_controller.configure_filter(
+            FilterConfig::<RX_DASH_FIFO, RX_DASH_FIFO>::from_id(rx_addrs.dash),
+            MaskConfig::<RX_DASH_FIFO>::match_exact(),
         ).await.unwrap();
 
         obd_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
@@ -357,6 +369,7 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x02] => 0x752,
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x03] => 0x753,
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x04] => 0x754,
+                addr if addr == rx_addrs.dash && transfer.pid() == [0xB0, 0x02] => 0x760,
                 _ => {
                     warn!("Unhandled ISO-TP response from address {:x} to PID {:x}: {:x}", transfer.raw_rx_addr(), transfer.pid(), transfer.data());
                     continue;
@@ -396,6 +409,7 @@ async fn obd_sender_task(
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x02])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x04])).unwrap(),
+        Frame::new(tx_addrs.dash, &construct_uds_query(&[0xB0, 0x02])).unwrap(),
     ];
 
     let mut ticker = Ticker::every(Duration::from_secs(1));
