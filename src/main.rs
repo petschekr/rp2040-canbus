@@ -55,6 +55,7 @@ struct ECUAddresses {
     iccu: Id,
     vcms: Id,
     dash: Id,
+    igpm: Id,
 }
 impl ECUAddresses {
     fn new() -> (Self, Self) {
@@ -66,6 +67,7 @@ impl ECUAddresses {
             iccu: StandardId::new(0x7E5).unwrap().into(),
             vcms: StandardId::new(0x744).unwrap().into(),
             dash: StandardId::new(0x7C6).unwrap().into(),
+            igpm: StandardId::new(0x770).unwrap().into(),
         };
         let rx = Self {
             bms: Self::rx_address(tx.bms),
@@ -75,6 +77,7 @@ impl ECUAddresses {
             iccu: Self::rx_address(tx.iccu),
             vcms: Self::rx_address(tx.vcms),
             dash: Self::rx_address(tx.dash),
+            igpm: Self::rx_address(tx.igpm),
         };
         (tx, rx)
     }
@@ -137,6 +140,7 @@ const RX_ADAS_FIFO: u8 = 5;
 const RX_ICCU_FIFO: u8 = 6;
 const RX_VCMS_FIFO: u8 = 7;
 const RX_DASH_FIFO: u8 = 8;
+const RX_IGPM_FIFO: u8 = 9;
 
 #[embassy_executor::task]
 async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>, cs: Output<'static>, mut int: Input<'static>) {
@@ -216,6 +220,14 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
         obd_controller.configure_filter(
             FilterConfig::<RX_DASH_FIFO, RX_DASH_FIFO>::from_id(rx_addrs.dash),
             MaskConfig::<RX_DASH_FIFO>::match_exact(),
+        ).await.unwrap();
+
+        obd_controller.configure_fifo(
+            FIFOConfig::<RX_IGPM_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
+        ).await.unwrap();
+        obd_controller.configure_filter(
+            FilterConfig::<RX_IGPM_FIFO, RX_IGPM_FIFO>::from_id(rx_addrs.igpm),
+            MaskConfig::<RX_IGPM_FIFO>::match_exact(),
         ).await.unwrap();
 
         obd_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
@@ -370,6 +382,8 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x03] => 0x753,
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x04] => 0x754,
                 addr if addr == rx_addrs.dash && transfer.pid() == [0xB0, 0x02] => 0x760,
+                addr if addr == rx_addrs.igpm && transfer.pid() == [0xBC, 0x03] => 0x773,
+                addr if addr == rx_addrs.igpm && transfer.pid() == [0xBC, 0x04] => 0x774,
                 _ => {
                     warn!("Unhandled ISO-TP response from address {:x} to PID {:x}: {:x}", transfer.raw_rx_addr(), transfer.pid(), transfer.data());
                     continue;
@@ -396,11 +410,11 @@ async fn obd_sender_task(
     let queries = [
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x01])).unwrap(),
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x05])).unwrap(),
-        Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x06])).unwrap(),
+        // Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x06])).unwrap(),
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x11])).unwrap(),
         Frame::new(tx_addrs.tpms, &construct_uds_query(&[0xC0, 0x0B])).unwrap(),
         Frame::new(tx_addrs.hvac, &construct_uds_query(&[0x01, 0x00])).unwrap(),
-        Frame::new(tx_addrs.adas, &construct_uds_query(&[0xF0, 0x10])).unwrap(),
+        // Frame::new(tx_addrs.adas, &construct_uds_query(&[0xF0, 0x10])).unwrap(),
         Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x01])).unwrap(),
         Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x02])).unwrap(),
         Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
@@ -410,6 +424,8 @@ async fn obd_sender_task(
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x04])).unwrap(),
         Frame::new(tx_addrs.dash, &construct_uds_query(&[0xB0, 0x02])).unwrap(),
+        Frame::new(tx_addrs.igpm, &construct_uds_query(&[0xBC, 0x03])).unwrap(),
+        Frame::new(tx_addrs.igpm, &construct_uds_query(&[0xBC, 0x04])).unwrap(),
     ];
 
     let mut ticker = Ticker::every(Duration::from_secs(1));
