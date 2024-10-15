@@ -28,6 +28,7 @@ static SPI_BUS0: StaticCell<Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>> = St
 static FORWARDING_CHANNEL: Channel<CriticalSectionRawMutex, (StandardId, Vec<u8, 64>), 10> = Channel::new();
 
 static OBD_CONTROLLER: StaticCell<Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<CriticalSectionRawMutex, SPI0Type<SPI0>, Output>>>> = StaticCell::new();
+static COMMA_CONTROLLER: StaticCell<Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<CriticalSectionRawMutex, SPI0Type<SPI0>, Output>>>> = StaticCell::new();
 
 static IS_CAR_OFF: StaticCell<Mutex<CriticalSectionRawMutex, bool>> = StaticCell::new();
 
@@ -127,9 +128,11 @@ async fn main(spawner: Spawner) {
 
     let i2c = i2c::I2c::new_async(p.I2C0, p.PIN_1, p.PIN_0, Irqs, i2c::Config::default());
 
-    spawner.must_spawn(obd_task(spawner, spi0, obd_cs, obd_int));
+    let is_car_off = IS_CAR_OFF.init(Mutex::new(true));
+
+    spawner.must_spawn(obd_task(spawner, spi0, obd_cs, obd_int, is_car_off));
     spawner.must_spawn(bme_sender_task(i2c));
-    spawner.must_spawn(comma_task(spi0, comma_cs, comma_int));
+    spawner.must_spawn(comma_task(spawner, spi0, comma_cs, comma_int, is_car_off));
 }
 
 const TRANSMIT_FIFO: u8 = 1;
@@ -143,7 +146,13 @@ const RX_DASH_FIFO: u8 = 8;
 const RX_IGPM_FIFO: u8 = 9;
 
 #[embassy_executor::task]
-async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>, cs: Output<'static>, mut int: Input<'static>) {
+async fn obd_task(
+    spawner: Spawner,
+    spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>,
+    cs: Output<'static>,
+    mut int: Input<'static>,
+    is_car_off: &'static Mutex<CriticalSectionRawMutex, bool>,
+) {
 
     let (tx_addrs, rx_addrs) = ECUAddresses::new();
 
@@ -233,7 +242,6 @@ async fn obd_task(spawner: Spawner, spi_bus: &'static Mutex<CriticalSectionRawMu
         obd_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
         Timer::after_millis(500).await;
     }
-    let is_car_off = IS_CAR_OFF.init(Mutex::new(true));
     spawner.must_spawn(obd_sender_task(obd_controller, tx_addrs, is_car_off));
 
     #[derive(Format)]
@@ -437,9 +445,13 @@ async fn obd_sender_task(
                 .unwrap();
             Timer::after_millis(30).await;
         }
-        if *is_car_off.lock().await {
-            // Wait 1 + 4 = 5 seconds between car off polls
-            ticker.reset_after(Duration::from_secs(4));
+        // Wait 5 minutes between polls if car is off
+        // Check for car on state while waiting once per second
+        for _ in 0..(60 * 5) {
+            if !*is_car_off.lock().await {
+                break;
+            }
+            Timer::after_millis(1000).await;
         }
         ticker.next().await;
     }
@@ -477,27 +489,45 @@ async fn bme_sender_task(i2c: i2c::I2c<'static, I2C0, i2c::Async>) {
     }
 }
 
+const IGNITION_FIFO: u8 = 2;
 #[embassy_executor::task]
-async fn comma_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>, cs: Output<'static>, _int: Input<'static>) {
+async fn comma_task(
+    spawner: Spawner,
+    spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>,
+    cs: Output<'static>,
+    int: Input<'static>,
+    is_car_off: &'static Mutex<CriticalSectionRawMutex, bool>,
+) {
     let comma_device = SpiDevice::new(spi_bus, cs);
-    let mut comma_controller = MCP25xxFD::new(comma_device);
+    let comma_controller = COMMA_CONTROLLER.init(Mutex::new(MCP25xxFD::new(comma_device)));
+    {
+        let mut comma_controller = comma_controller.lock().await;
+        comma_controller.reset_and_apply_config(&Config {
+            clock: Clock::Clock20MHz,
+            bit_rate: BitRate::default(),
+            ecc_enabled: true,
+            restrict_retx_attempts: false,
+            txq_enabled: false,
+            tx_event_fifo_enabled: false,
+            iso_crc_enabled: true,
+        }).await.unwrap();
 
-    comma_controller.reset_and_apply_config(&Config {
-        clock: Clock::Clock20MHz,
-        bit_rate: BitRate::default(),
-        ecc_enabled: true,
-        restrict_retx_attempts: false,
-        txq_enabled: false,
-        tx_event_fifo_enabled: false,
-        iso_crc_enabled: true,
-    }).await.unwrap();
+        comma_controller.configure_fifo(
+            FIFOConfig::<TRANSMIT_FIFO>::tx_with_size(8, PayloadSize::Bytes64)
+        ).await.unwrap();
 
-    comma_controller.configure_fifo(
-        FIFOConfig::<TRANSMIT_FIFO>::tx_with_size(8, PayloadSize::Bytes64)
-    ).await.unwrap();
+        comma_controller.configure_fifo(
+            FIFOConfig::<IGNITION_FIFO>::rx_with_size(32, PayloadSize::Bytes8)
+        ).await.unwrap();
+        comma_controller.configure_filter(
+            FilterConfig::<IGNITION_FIFO, IGNITION_FIFO>::from_id(StandardId::new(0x201).unwrap()),
+            MaskConfig::<IGNITION_FIFO>::match_exact(),
+        ).await.unwrap();
 
-    comma_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
-    Timer::after_millis(500).await;
+        comma_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
+        Timer::after_millis(500).await;
+    }
+    spawner.must_spawn(comma_car_on_task(comma_controller, int, is_car_off));
 
     loop {
         let (forward_addr, forward_data) = FORWARDING_CHANNEL.receive().await;
@@ -505,11 +535,28 @@ async fn comma_task(spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SP
 
         debug!("Forwarding {} bytes to address {:x}", forward_data.len(), forward_addr.as_raw());
 
-        match comma_controller.transmit::<TRANSMIT_FIFO>(&forward_frame).await {
+        match comma_controller.lock().await.transmit::<TRANSMIT_FIFO>(&forward_frame).await {
             Ok(()) => {},
             Err(err) => {
                 error!("Forwarding error: {}", err);
             }
         }
+    }
+}
+
+#[embassy_executor::task]
+async fn comma_car_on_task(
+    comma_controller: &'static Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<'_, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'_>>>>,
+    mut int: Input<'static>,
+    is_car_off: &'static Mutex<CriticalSectionRawMutex, bool>,
+) {
+    loop {
+        // Wait for interrupt pin to go low (aka active) before calling receive so we don't spinlock
+        int.wait_for_low().await;
+        if let Ok(Some(_)) = comma_controller.lock().await.receive(Some(IGNITION_FIFO)).await {
+            debug!("Car ignition detected via CAN 0");
+            *is_car_off.lock().await = false;
+        }
+        Timer::after_millis(1000).await;
     }
 }
