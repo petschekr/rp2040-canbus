@@ -346,12 +346,14 @@ async fn obd_task(
                     let _ = embassy_time::with_timeout(Duration::from_millis(250), int.wait_for_low()).await;
                 },
                 Err(mcp25xxfd::Error::ControllerError(description)) => {
-                    error!("{}", description);
+                    error!("{} Transfer: {}", description, transfer);
                     FORWARDING_CHANNEL.send((StandardId::new(0x700).unwrap(), Vec::from_slice(description.as_bytes()).unwrap())).await;
+                    transfer = None;
                     break;
                 },
                 Err(err) => {
                     dbg!(err);
+                    transfer = None;
                     break;
                 },
             }
