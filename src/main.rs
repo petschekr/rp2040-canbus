@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-use bme280_rs::AsyncBme280;
+use bme280_rs::{AsyncBme280, Humidity, Temperature};
 use defmt::*;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
@@ -19,6 +19,7 @@ use mcp25xxfd::frame::Frame;
 use mcp25xxfd::{config::{BitRate, Clock, Config, FIFOConfig, FilterConfig, MaskConfig}, registers, MCP25xxFD};
 use mcp25xxfd::registers::PayloadSize;
 use static_cell::StaticCell;
+use micromath::F32Ext;
 
 use {defmt_rtt as _, panic_probe as _};
 
@@ -473,14 +474,30 @@ async fn bme_sender_task(i2c: i2c::I2c<'static, I2C0, i2c::Async>) {
             .with_filter(bme280_rs::Filter::Filter4)
     ).await.unwrap();
 
+    fn compensate_temperature(sensor_temp: Temperature) -> Temperature {
+        sensor_temp - 6.0
+    }
+    fn compensate_humidity(sensor_temp: Temperature, sensor_humidity: Humidity) -> Humidity {
+        // From https://www.renesas.com/ja/document/apn/compensating-temperature-and-relative-humidity-pcb
+        const A: f32 = 6.1162;
+        const M: f32 = 7.5892;
+        const TN: f32 = 240.71;
+
+        let corrected_temp = compensate_temperature(sensor_temp);
+        let sensor_saturation_vapor_pressure = A * f32::powf(10.0,(M * sensor_temp) / (sensor_temp + TN));
+        let corrected_saturation_vapor_pressure = A * f32::powf(10.0,(M * corrected_temp) / (corrected_temp + TN));
+        let vapor_pressure = (sensor_humidity * sensor_saturation_vapor_pressure) / 100.0;
+        (vapor_pressure / corrected_saturation_vapor_pressure) * 100.0
+    }
+
     let mut ticker = Ticker::every(Duration::from_secs(30));
     loop {
         let mut forward_data: Vec<u8, 64> = Vec::new();
 
         let sample = bme280.read_sample().await.unwrap();
         let pressure = sample.pressure.unwrap_or(0.0).to_be_bytes();
-        let temperature = sample.temperature.unwrap_or(0.0).to_be_bytes();
-        let humidity = sample.humidity.unwrap_or(0.0).to_be_bytes();
+        let temperature = compensate_temperature(sample.temperature.unwrap_or(0.0)).to_be_bytes();
+        let humidity = compensate_humidity(sample.temperature.unwrap_or(0.0), sample.humidity.unwrap_or(0.0)).to_be_bytes();
 
         forward_data.extend_from_slice(&pressure).unwrap();
         forward_data.extend_from_slice(&temperature).unwrap();

@@ -37,6 +37,7 @@ static_cell = "2"
 portable-atomic = { version = "1.5", features = ["critical-section"] }
 heapless = { version = "0.8", features = ["defmt-03"] }
 embedded-can = { git = "https://github.com/rust-embedded/embedded-hal.git", features = ["defmt-03"]}
+micromath = "2.1.0"
 
 mcp25xxfd = { path = "/home/petschekr/Documents/Software/mcp25xxFD", features = ["defmt"] }
 bme280-rs = { version = "0.3.0", features = ["async"] }
