@@ -31,7 +31,7 @@ static FORWARDING_CHANNEL: Channel<CriticalSectionRawMutex, (StandardId, Vec<u8,
 static OBD_CONTROLLER: StaticCell<Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<CriticalSectionRawMutex, SPI0Type<SPI0>, Output>>>> = StaticCell::new();
 static COMMA_CONTROLLER: StaticCell<Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<CriticalSectionRawMutex, SPI0Type<SPI0>, Output>>>> = StaticCell::new();
 
-static IS_CAR_OFF: StaticCell<Mutex<CriticalSectionRawMutex, bool>> = StaticCell::new();
+static CAR_OFF_SINCE: StaticCell<Mutex<CriticalSectionRawMutex, Option<Instant>>> = StaticCell::new();
 
 embassy_rp::bind_interrupts!(struct Irqs {
     I2C0_IRQ => i2c::InterruptHandler<I2C0>;
@@ -129,11 +129,11 @@ async fn main(spawner: Spawner) {
 
     let i2c = i2c::I2c::new_async(p.I2C0, p.PIN_1, p.PIN_0, Irqs, i2c::Config::default());
 
-    let is_car_off = IS_CAR_OFF.init(Mutex::new(true));
+    let car_off_since = CAR_OFF_SINCE.init(Mutex::new(None));
 
-    spawner.must_spawn(obd_task(spawner, spi0, obd_cs, obd_int, is_car_off));
+    spawner.must_spawn(obd_task(spawner, spi0, obd_cs, obd_int, car_off_since));
     spawner.must_spawn(bme_sender_task(i2c));
-    spawner.must_spawn(comma_task(spawner, spi0, comma_cs, comma_int, is_car_off));
+    spawner.must_spawn(comma_task(spawner, spi0, comma_cs, comma_int, car_off_since));
 }
 
 const TRANSMIT_FIFO: u8 = 1;
@@ -152,7 +152,7 @@ async fn obd_task(
     spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>,
     cs: Output<'static>,
     mut int: Input<'static>,
-    is_car_off: &'static Mutex<CriticalSectionRawMutex, bool>,
+    car_off_since: &'static Mutex<CriticalSectionRawMutex, Option<Instant>>,
 ) {
 
     let (tx_addrs, rx_addrs) = ECUAddresses::new();
@@ -243,7 +243,7 @@ async fn obd_task(
         obd_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
         Timer::after_millis(500).await;
     }
-    spawner.must_spawn(obd_sender_task(obd_controller, tx_addrs, is_car_off));
+    spawner.must_spawn(obd_sender_task(obd_controller, tx_addrs, car_off_since));
 
     #[derive(Format)]
     struct ISOTPTransfer {
@@ -374,8 +374,18 @@ async fn obd_task(
         if let Some(transfer) = transfer.take() {
             let forwarding_address = match transfer.rx_addr {
                 addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x01] => {
+                    let mut car_off_since = car_off_since.lock().await;
                     // Poll more frequently when the HV battery is connected (current > 0 amps)
-                    *is_car_off.lock().await = transfer.data()[10..12] == [0x00, 0x00];
+                    if transfer.data()[10..12] == [0x00, 0x00] {
+                        // Battery current is 0.0 amps -- car is off
+                        if car_off_since.is_none() {
+                            *car_off_since = Some(Instant::now());
+                        }
+                    }
+                    else {
+                        // Car is on
+                        *car_off_since = None;
+                    }
                     0x701
                 },
                 addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x05] => 0x705,
@@ -416,7 +426,7 @@ async fn obd_task(
 async fn obd_sender_task(
     obd_controller: &'static Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<'_, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'_>>>>,
     tx_addrs: ECUAddresses,
-    is_car_off: &'static Mutex<CriticalSectionRawMutex, bool>,
+    car_off_since: &'static Mutex<CriticalSectionRawMutex, Option<Instant>>,
 ) {
     let queries = [
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x01])).unwrap(),
@@ -448,10 +458,17 @@ async fn obd_sender_task(
                 .unwrap();
             Timer::after_millis(30).await;
         }
-        // Wait 5 minutes between polls if car is off
-        // Check for car on state while waiting once per second
+        // Wait 5 minutes between polls if car is off to allow ECUs to deep sleep and save battery
+        // Check once per second while waiting to see if car is on again
         for _ in 0..(60 * 5) {
-            if !*is_car_off.lock().await {
+            if let Some(off_time) = *car_off_since.lock().await {
+                // If car turned off less than 1 minute ago, exit timer loop and keep quick polling
+                if off_time.elapsed().as_secs() < 60 {
+                    break;
+                }
+            }
+            else {
+                // Car is on, exit 5-minute timer loop
                 break;
             }
             Timer::after_millis(1000).await;
@@ -515,7 +532,7 @@ async fn comma_task(
     spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>,
     cs: Output<'static>,
     int: Input<'static>,
-    is_car_off: &'static Mutex<CriticalSectionRawMutex, bool>,
+    car_off_since: &'static Mutex<CriticalSectionRawMutex, Option<Instant>>,
 ) {
     let comma_device = SpiDevice::new(spi_bus, cs);
     let comma_controller = COMMA_CONTROLLER.init(Mutex::new(MCP25xxFD::new(comma_device)));
@@ -546,7 +563,7 @@ async fn comma_task(
         comma_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
         Timer::after_millis(500).await;
     }
-    spawner.must_spawn(comma_car_on_task(comma_controller, int, is_car_off));
+    spawner.must_spawn(comma_car_on_task(comma_controller, int, car_off_since));
 
     loop {
         let (forward_addr, forward_data) = FORWARDING_CHANNEL.receive().await;
@@ -567,14 +584,14 @@ async fn comma_task(
 async fn comma_car_on_task(
     comma_controller: &'static Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<'_, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'_>>>>,
     mut int: Input<'static>,
-    is_car_off: &'static Mutex<CriticalSectionRawMutex, bool>,
+    car_off_since: &'static Mutex<CriticalSectionRawMutex, Option<Instant>>,
 ) {
     loop {
         // Wait for interrupt pin to go low (aka active) before calling receive so we don't spinlock
         int.wait_for_low().await;
         if let Ok(Some(_)) = comma_controller.lock().await.receive(Some(IGNITION_FIFO)).await {
             debug!("Car ignition detected via CAN 0");
-            *is_car_off.lock().await = false;
+            *car_off_since.lock().await = None;
         }
         Timer::after_millis(1000).await;
     }
