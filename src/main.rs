@@ -6,35 +6,52 @@ use defmt::*;
 use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 use embassy_executor::Spawner;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
-use embassy_rp::i2c;
-use embassy_rp::peripherals::{SPI0, I2C0};
+use embassy_rp::peripherals::{DMA_CH0, DMA_CH1, I2C0, SPI0};
 use embassy_rp::spi::{self, Spi};
+use embassy_rp::{dma, i2c};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::mutex::Mutex;
 use embassy_sync::channel::Channel;
-use embassy_time::{Delay, Timer, Duration, Ticker, Instant};
+use embassy_sync::mutex::Mutex;
+use embassy_time::{Delay, Duration, Instant, Ticker, Timer};
 use embedded_can::{ExtendedId, Id, StandardId};
 use heapless::Vec;
 use mcp25xxfd::frame::Frame;
-use mcp25xxfd::{config::{BitRate, Clock, Config, FIFOConfig, FilterConfig, MaskConfig}, registers, MCP25xxFD};
 use mcp25xxfd::registers::PayloadSize;
-use static_cell::StaticCell;
+use mcp25xxfd::{
+    MCP25xxFD,
+    config::{BitRate, Clock, Config, FIFOConfig, FilterConfig, MaskConfig},
+    registers,
+};
 use micromath::F32Ext;
+use static_cell::StaticCell;
 
 use {defmt_rtt as _, panic_probe as _};
 
 type SPI0Type<BUS> = Spi<'static, BUS, spi::Async>;
 static SPI_BUS0: StaticCell<Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>> = StaticCell::new();
 
-static FORWARDING_CHANNEL: Channel<CriticalSectionRawMutex, (StandardId, Vec<u8, 64>), 10> = Channel::new();
+static FORWARDING_CHANNEL: Channel<CriticalSectionRawMutex, (StandardId, Vec<u8, 64>), 10> =
+    Channel::new();
 
-static OBD_CONTROLLER: StaticCell<Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<CriticalSectionRawMutex, SPI0Type<SPI0>, Output>>>> = StaticCell::new();
-static COMMA_CONTROLLER: StaticCell<Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<CriticalSectionRawMutex, SPI0Type<SPI0>, Output>>>> = StaticCell::new();
+static OBD_CONTROLLER: StaticCell<
+    Mutex<
+        CriticalSectionRawMutex,
+        MCP25xxFD<SpiDevice<CriticalSectionRawMutex, SPI0Type<SPI0>, Output>>,
+    >,
+> = StaticCell::new();
+static COMMA_CONTROLLER: StaticCell<
+    Mutex<
+        CriticalSectionRawMutex,
+        MCP25xxFD<SpiDevice<CriticalSectionRawMutex, SPI0Type<SPI0>, Output>>,
+    >,
+> = StaticCell::new();
 
-static CAR_OFF_SINCE: StaticCell<Mutex<CriticalSectionRawMutex, Option<Instant>>> = StaticCell::new();
+static CAR_OFF_SINCE: StaticCell<Mutex<CriticalSectionRawMutex, Option<Instant>>> =
+    StaticCell::new();
 
 embassy_rp::bind_interrupts!(struct Irqs {
     I2C0_IRQ => i2c::InterruptHandler<I2C0>;
+    DMA_IRQ_0 => dma::InterruptHandler<DMA_CH0>, dma::InterruptHandler<DMA_CH1>;
 });
 
 fn construct_uds_query(command: &[u8]) -> [u8; 8] {
@@ -86,8 +103,12 @@ impl ECUAddresses {
     fn address_offset<const O: i32>(ecu_addr: impl Into<Id>) -> Id {
         let ecu_addr = ecu_addr.into();
         match ecu_addr {
-            Id::Standard(addr) => StandardId::new(((addr.as_raw() as i32) + O) as u16).unwrap().into(),
-            Id::Extended(addr) => ExtendedId::new(((addr.as_raw() as i32) + O) as u32).unwrap().into(),
+            Id::Standard(addr) => StandardId::new(((addr.as_raw() as i32) + O) as u16)
+                .unwrap()
+                .into(),
+            Id::Extended(addr) => ExtendedId::new(((addr.as_raw() as i32) + O) as u32)
+                .unwrap()
+                .into(),
         }
     }
     fn rx_address(ecu_addr: impl Into<Id>) -> Id {
@@ -113,6 +134,7 @@ async fn main(spawner: Spawner) {
         miso,
         p.DMA_CH0,
         p.DMA_CH1,
+        Irqs,
         spi::Config::default(),
     );
     let spi0 = SPI_BUS0.init(Mutex::new(spi0));
@@ -131,9 +153,9 @@ async fn main(spawner: Spawner) {
 
     let car_off_since = CAR_OFF_SINCE.init(Mutex::new(None));
 
-    spawner.must_spawn(obd_task(spawner, spi0, obd_cs, obd_int, car_off_since));
-    spawner.must_spawn(bme_sender_task(i2c));
-    spawner.must_spawn(comma_task(spawner, spi0, comma_cs, comma_int, car_off_since));
+    spawner.spawn(obd_task(spawner, spi0, obd_cs, obd_int, car_off_since).unwrap());
+    spawner.spawn(bme_sender_task(i2c).unwrap());
+    spawner.spawn(comma_task(spawner, spi0, comma_cs, comma_int, car_off_since).unwrap());
 }
 
 const TRANSMIT_FIFO: u8 = 1;
@@ -154,7 +176,6 @@ async fn obd_task(
     mut int: Input<'static>,
     car_off_since: &'static Mutex<CriticalSectionRawMutex, Option<Instant>>,
 ) {
-
     let (tx_addrs, rx_addrs) = ECUAddresses::new();
 
     let obd_device = SpiDevice::new(spi_bus, cs);
@@ -162,88 +183,154 @@ async fn obd_task(
 
     {
         let mut obd_controller = obd_controller.lock().await;
-        obd_controller.reset_and_apply_config(&Config {
-            clock: Clock::Clock20MHz,
-            bit_rate: BitRate::default(),
-            ecc_enabled: true,
-            restrict_retx_attempts: false,
-            txq_enabled: false,
-            tx_event_fifo_enabled: false,
-            iso_crc_enabled: true,
-        }).await.unwrap();
+        obd_controller
+            .reset_and_apply_config(&Config {
+                clock: Clock::Clock20MHz,
+                bit_rate: BitRate::default(),
+                ecc_enabled: true,
+                restrict_retx_attempts: false,
+                txq_enabled: false,
+                tx_event_fifo_enabled: false,
+                iso_crc_enabled: true,
+            })
+            .await
+            .unwrap();
 
-        obd_controller.configure_fifo(
-            FIFOConfig::<TRANSMIT_FIFO>::tx_with_size(8, PayloadSize::Bytes8)
-        ).await.unwrap();
+        obd_controller
+            .configure_fifo(FIFOConfig::<TRANSMIT_FIFO>::tx_with_size(
+                8,
+                PayloadSize::Bytes8,
+            ))
+            .await
+            .unwrap();
 
-        obd_controller.configure_fifo(
-            FIFOConfig::<RX_BATTERY_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
-        ).await.unwrap();
-        obd_controller.configure_filter(
-            FilterConfig::<RX_BATTERY_FIFO, RX_BATTERY_FIFO>::from_id(rx_addrs.bms),
-            MaskConfig::<RX_BATTERY_FIFO>::match_exact(),
-        ).await.unwrap();
+        obd_controller
+            .configure_fifo(FIFOConfig::<RX_BATTERY_FIFO>::rx_with_size(
+                8,
+                PayloadSize::Bytes8,
+            ))
+            .await
+            .unwrap();
+        obd_controller
+            .configure_filter(
+                FilterConfig::<RX_BATTERY_FIFO, RX_BATTERY_FIFO>::from_id(rx_addrs.bms),
+                MaskConfig::<RX_BATTERY_FIFO>::match_exact(),
+            )
+            .await
+            .unwrap();
 
-        obd_controller.configure_fifo(
-            FIFOConfig::<RX_TPMS_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
-        ).await.unwrap();
-        obd_controller.configure_filter(
-            FilterConfig::<RX_TPMS_FIFO, RX_TPMS_FIFO>::from_id(rx_addrs.tpms),
-            MaskConfig::<RX_TPMS_FIFO>::match_exact(),
-        ).await.unwrap();
+        obd_controller
+            .configure_fifo(FIFOConfig::<RX_TPMS_FIFO>::rx_with_size(
+                8,
+                PayloadSize::Bytes8,
+            ))
+            .await
+            .unwrap();
+        obd_controller
+            .configure_filter(
+                FilterConfig::<RX_TPMS_FIFO, RX_TPMS_FIFO>::from_id(rx_addrs.tpms),
+                MaskConfig::<RX_TPMS_FIFO>::match_exact(),
+            )
+            .await
+            .unwrap();
 
-        obd_controller.configure_fifo(
-            FIFOConfig::<RX_HVAC_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
-        ).await.unwrap();
-        obd_controller.configure_filter(
-            FilterConfig::<RX_HVAC_FIFO, RX_HVAC_FIFO>::from_id(rx_addrs.hvac),
-            MaskConfig::<RX_HVAC_FIFO>::match_exact(),
-        ).await.unwrap();
+        obd_controller
+            .configure_fifo(FIFOConfig::<RX_HVAC_FIFO>::rx_with_size(
+                8,
+                PayloadSize::Bytes8,
+            ))
+            .await
+            .unwrap();
+        obd_controller
+            .configure_filter(
+                FilterConfig::<RX_HVAC_FIFO, RX_HVAC_FIFO>::from_id(rx_addrs.hvac),
+                MaskConfig::<RX_HVAC_FIFO>::match_exact(),
+            )
+            .await
+            .unwrap();
 
-        obd_controller.configure_fifo(
-            FIFOConfig::<RX_ADAS_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
-        ).await.unwrap();
-        obd_controller.configure_filter(
-            FilterConfig::<RX_ADAS_FIFO, RX_ADAS_FIFO>::from_id(rx_addrs.adas),
-            MaskConfig::<RX_ADAS_FIFO>::match_exact(),
-        ).await.unwrap();
+        obd_controller
+            .configure_fifo(FIFOConfig::<RX_ADAS_FIFO>::rx_with_size(
+                8,
+                PayloadSize::Bytes8,
+            ))
+            .await
+            .unwrap();
+        obd_controller
+            .configure_filter(
+                FilterConfig::<RX_ADAS_FIFO, RX_ADAS_FIFO>::from_id(rx_addrs.adas),
+                MaskConfig::<RX_ADAS_FIFO>::match_exact(),
+            )
+            .await
+            .unwrap();
 
-        obd_controller.configure_fifo(
-            FIFOConfig::<RX_ICCU_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
-        ).await.unwrap();
-        obd_controller.configure_filter(
-            FilterConfig::<RX_ICCU_FIFO, RX_ICCU_FIFO>::from_id(rx_addrs.iccu),
-            MaskConfig::<RX_ICCU_FIFO>::match_exact(),
-        ).await.unwrap();
+        obd_controller
+            .configure_fifo(FIFOConfig::<RX_ICCU_FIFO>::rx_with_size(
+                8,
+                PayloadSize::Bytes8,
+            ))
+            .await
+            .unwrap();
+        obd_controller
+            .configure_filter(
+                FilterConfig::<RX_ICCU_FIFO, RX_ICCU_FIFO>::from_id(rx_addrs.iccu),
+                MaskConfig::<RX_ICCU_FIFO>::match_exact(),
+            )
+            .await
+            .unwrap();
 
-        obd_controller.configure_fifo(
-            FIFOConfig::<RX_VCMS_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
-        ).await.unwrap();
-        obd_controller.configure_filter(
-            FilterConfig::<RX_VCMS_FIFO, RX_VCMS_FIFO>::from_id(rx_addrs.vcms),
-            MaskConfig::<RX_VCMS_FIFO>::match_exact(),
-        ).await.unwrap();
+        obd_controller
+            .configure_fifo(FIFOConfig::<RX_VCMS_FIFO>::rx_with_size(
+                8,
+                PayloadSize::Bytes8,
+            ))
+            .await
+            .unwrap();
+        obd_controller
+            .configure_filter(
+                FilterConfig::<RX_VCMS_FIFO, RX_VCMS_FIFO>::from_id(rx_addrs.vcms),
+                MaskConfig::<RX_VCMS_FIFO>::match_exact(),
+            )
+            .await
+            .unwrap();
 
-        obd_controller.configure_fifo(
-            FIFOConfig::<RX_DASH_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
-        ).await.unwrap();
-        obd_controller.configure_filter(
-            FilterConfig::<RX_DASH_FIFO, RX_DASH_FIFO>::from_id(rx_addrs.dash),
-            MaskConfig::<RX_DASH_FIFO>::match_exact(),
-        ).await.unwrap();
+        obd_controller
+            .configure_fifo(FIFOConfig::<RX_DASH_FIFO>::rx_with_size(
+                8,
+                PayloadSize::Bytes8,
+            ))
+            .await
+            .unwrap();
+        obd_controller
+            .configure_filter(
+                FilterConfig::<RX_DASH_FIFO, RX_DASH_FIFO>::from_id(rx_addrs.dash),
+                MaskConfig::<RX_DASH_FIFO>::match_exact(),
+            )
+            .await
+            .unwrap();
 
-        obd_controller.configure_fifo(
-            FIFOConfig::<RX_IGPM_FIFO>::rx_with_size(8, PayloadSize::Bytes8)
-        ).await.unwrap();
-        obd_controller.configure_filter(
-            FilterConfig::<RX_IGPM_FIFO, RX_IGPM_FIFO>::from_id(rx_addrs.igpm),
-            MaskConfig::<RX_IGPM_FIFO>::match_exact(),
-        ).await.unwrap();
+        obd_controller
+            .configure_fifo(FIFOConfig::<RX_IGPM_FIFO>::rx_with_size(
+                8,
+                PayloadSize::Bytes8,
+            ))
+            .await
+            .unwrap();
+        obd_controller
+            .configure_filter(
+                FilterConfig::<RX_IGPM_FIFO, RX_IGPM_FIFO>::from_id(rx_addrs.igpm),
+                MaskConfig::<RX_IGPM_FIFO>::match_exact(),
+            )
+            .await
+            .unwrap();
 
-        obd_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
+        obd_controller
+            .set_mode(registers::OperationMode::Normal)
+            .await
+            .unwrap();
         Timer::after_millis(500).await;
     }
-    spawner.must_spawn(obd_sender_task(obd_controller, tx_addrs, car_off_since));
+    spawner.spawn(obd_sender_task(obd_controller, tx_addrs, car_off_since).unwrap());
 
     #[derive(Format)]
     struct ISOTPTransfer {
@@ -290,31 +377,60 @@ async fn obd_task(
             let rx_fifo = transfer.as_ref().map(|t| t.rx_fifo); // Hold the RX FIFO number if there is an active transfer
             match obd_controller.receive(rx_fifo).await {
                 Ok(Some((fifo, frame))) => {
-                    trace!("Received message from FIFO{}: {:x} ({} bytes): {:x}", fifo, frame.raw_id(), frame.data().len(), frame.data());
+                    trace!(
+                        "Received message from FIFO{}: {:x} ({} bytes): {:x}",
+                        fifo,
+                        frame.raw_id(),
+                        frame.data().len(),
+                        frame.data()
+                    );
 
                     match frame.data()[0] >> 4 {
                         0 => {
                             // Single ISO-TP frame
                             trace!("Single frame of data");
                             // ISO-TP transmission complete
-                            transfer = Some(ISOTPTransfer::new(frame.id(),&frame.data()[1..], 8 - 3, fifo));
+                            transfer = Some(ISOTPTransfer::new(
+                                frame.id(),
+                                &frame.data()[1..],
+                                8 - 3,
+                                fifo,
+                            ));
                             break;
-                        },
+                        }
                         1 => {
                             // First ISO-TP frame
-                            let length = frame.data()[1] as u16 + ((frame.data()[0] as u16 & 0b1111) << 8);
+                            let length =
+                                frame.data()[1] as u16 + ((frame.data()[0] as u16 & 0b1111) << 8);
                             trace!("First frame of data with total length {}", length);
                             if length >= 80 {
-                                warn!("Unable to handle ISO-TP transmission with length {} (ECU: {:x}, PID: {:x})", length, frame.raw_id(), &frame.data());
+                                warn!(
+                                    "Unable to handle ISO-TP transmission with length {} (ECU: {:x}, PID: {:x})",
+                                    length,
+                                    frame.raw_id(),
+                                    &frame.data()
+                                );
                                 transfer = None;
                                 break;
                             }
-                            transfer = Some(ISOTPTransfer::new(frame.id(), &frame.data()[2..], length, fifo));
+                            transfer = Some(ISOTPTransfer::new(
+                                frame.id(),
+                                &frame.data()[2..],
+                                length,
+                                fifo,
+                            ));
 
                             // Send flow control message to receive the rest of the data
-                            let flow_control_frame = Frame::new(ECUAddresses::tx_address(frame.id()), &[0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]).unwrap();
-                            obd_controller.transmit::<TRANSMIT_FIFO>(&flow_control_frame).await.unwrap();
-                        },
+                            let flow_control_frame = Frame::new(
+                                ECUAddresses::tx_address(frame.id()),
+                                &[0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+                            )
+                            .unwrap();
+                            obd_controller
+                                .transmit::<TRANSMIT_FIFO>(&flow_control_frame)
+                                .await
+                                .unwrap();
+                        }
                         2 => {
                             // Consecutive ISO-TP frame
                             let frame_number = frame.data()[0] & 0b1111;
@@ -322,54 +438,74 @@ async fn obd_task(
 
                             match transfer {
                                 Some(ref mut transfer) => {
-                                    let remaining_bytes: usize = transfer.length as usize - transfer.raw_data.len();
+                                    let remaining_bytes: usize =
+                                        transfer.length as usize - transfer.raw_data.len();
                                     if remaining_bytes > 7 {
-                                        transfer.raw_data.extend_from_slice(&frame.data()[1..]).unwrap();
-                                    }
-                                    else {
+                                        transfer
+                                            .raw_data
+                                            .extend_from_slice(&frame.data()[1..])
+                                            .unwrap();
+                                    } else {
                                         // Don't copy more bytes than the transfer size
-                                        transfer.raw_data.extend_from_slice(&frame.data()[1..1 + remaining_bytes]).unwrap();
+                                        transfer
+                                            .raw_data
+                                            .extend_from_slice(
+                                                &frame.data()[1..1 + remaining_bytes],
+                                            )
+                                            .unwrap();
                                     }
 
                                     if transfer.raw_data.len() as u16 >= transfer.length {
                                         // ISO-TP transmission complete
                                         break;
                                     }
-                                },
-                                None => warn!("Received consecutive frame without an active transfer!"),
+                                }
+                                None => {
+                                    warn!("Received consecutive frame without an active transfer!")
+                                }
                             }
-                        },
-                        _ => {},
+                        }
+                        _ => {}
                     }
-                },
+                }
                 Ok(None) => {
                     // No message in the specified RX FIFO, wait for another RX interrupt before continuing (but not more than 250 ms)
-                    let _ = embassy_time::with_timeout(Duration::from_millis(250), int.wait_for_low()).await;
-                },
+                    let _ =
+                        embassy_time::with_timeout(Duration::from_millis(250), int.wait_for_low())
+                            .await;
+                }
                 Err(mcp25xxfd::Error::ControllerError(description)) => {
                     error!("{} Transfer: {}", description, transfer);
-                    FORWARDING_CHANNEL.send((StandardId::new(0x700).unwrap(), Vec::from_slice(description.as_bytes()).unwrap())).await;
+                    FORWARDING_CHANNEL
+                        .send((
+                            StandardId::new(0x700).unwrap(),
+                            Vec::from_slice(description.as_bytes()).unwrap(),
+                        ))
+                        .await;
                     transfer = None;
                     break;
-                },
+                }
                 Err(err) => {
                     dbg!(err);
                     transfer = None;
                     break;
-                },
+                }
             }
             // If we've been receiving for more than 250 milliseconds, abort so that we don't hold the mutex lock forever
             if transfer_start.elapsed().as_millis() > 250 {
                 if let Some(transfer) = transfer {
-                    warn!("Transfer from {:x} timed out: {:?}", transfer.raw_rx_addr(), transfer);
-                }
-                else {
+                    warn!(
+                        "Transfer from {:x} timed out: {:?}",
+                        transfer.raw_rx_addr(),
+                        transfer
+                    );
+                } else {
                     warn!("Unknown transfer timed out");
                 }
                 transfer = None;
                 break;
             }
-        };
+        }
 
         if let Some(transfer) = transfer.take() {
             let forwarding_address = match transfer.rx_addr {
@@ -381,13 +517,12 @@ async fn obd_task(
                         if car_off_since.is_none() {
                             *car_off_since = Some(Instant::now());
                         }
-                    }
-                    else {
+                    } else {
                         // Car is on
                         *car_off_since = None;
                     }
                     0x701
-                },
+                }
                 addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x05] => 0x705,
                 addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x06] => 0x706,
                 addr if addr == rx_addrs.bms && transfer.pid() == [0x01, 0x11] => 0x70B,
@@ -404,8 +539,7 @@ async fn obd_task(
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x04] => 0x754,
                 addr if addr == rx_addrs.dash && transfer.pid() == [0xB0, 0x02] => 0x760,
                 addr if addr == rx_addrs.igpm && transfer.pid() == [0xBC, 0x03] => {
-                    let car_not_in_parked_state =
-                        transfer.data()[5] & (1 << 0) > 0 // Hood open
+                    let car_not_in_parked_state = transfer.data()[5] & (1 << 0) > 0 // Hood open
                         || transfer.data()[4] & (1 << 0) > 0 // Rear Left door open
                         || transfer.data()[4] & (1 << 1) > 0 // Rear Left door unlocked
                         || transfer.data()[4] & (1 << 2) > 0 // Rear Right door open
@@ -419,10 +553,9 @@ async fn obd_task(
                         *car_off_since = None;
                     }
                     0x773
-                },
+                }
                 addr if addr == rx_addrs.igpm && transfer.pid() == [0xBC, 0x04] => {
-                    let car_not_in_parked_state =
-                        transfer.data()[4] & (1 << 3) > 0 // Driver door unlocked
+                    let car_not_in_parked_state = transfer.data()[4] & (1 << 3) > 0 // Driver door unlocked
                         || transfer.data()[4] & (1 << 2) > 0; // Passenger door unlocked
                     if car_not_in_parked_state {
                         // Consider car to be on and keep quick polling until all doors closed and locked
@@ -430,27 +563,34 @@ async fn obd_task(
                         *car_off_since = None;
                     }
                     0x774
-                },
+                }
                 _ => {
-                    warn!("Unhandled ISO-TP response from address {:x} to PID {:x}: {:x}", transfer.raw_rx_addr(), transfer.pid(), transfer.data());
+                    warn!(
+                        "Unhandled ISO-TP response from address {:x} to PID {:x}: {:x}",
+                        transfer.raw_rx_addr(),
+                        transfer.pid(),
+                        transfer.data()
+                    );
                     continue;
-                },
+                }
             };
             let forwarding_address = StandardId::new(forwarding_address).unwrap();
-            FORWARDING_CHANNEL.send((forwarding_address, Vec::from_slice(
-                &transfer
-                    .data()
-                    .chunks(64)
-                    .next()
-                    .unwrap()
-            ).unwrap())).await;
+            FORWARDING_CHANNEL
+                .send((
+                    forwarding_address,
+                    Vec::from_slice(&transfer.data().chunks(64).next().unwrap()).unwrap(),
+                ))
+                .await;
         }
     }
 }
 
 #[embassy_executor::task]
 async fn obd_sender_task(
-    obd_controller: &'static Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<'_, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'_>>>>,
+    obd_controller: &'static Mutex<
+        CriticalSectionRawMutex,
+        MCP25xxFD<SpiDevice<'static, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'static>>>,
+    >,
     tx_addrs: ECUAddresses,
     car_off_since: &'static Mutex<CriticalSectionRawMutex, Option<Instant>>,
 ) {
@@ -479,8 +619,10 @@ async fn obd_sender_task(
     loop {
         for frame in queries.iter() {
             obd_controller
-                .lock().await
-                .transmit::<TRANSMIT_FIFO>(frame).await
+                .lock()
+                .await
+                .transmit::<TRANSMIT_FIFO>(frame)
+                .await
                 .unwrap();
             Timer::after_millis(30).await;
         }
@@ -492,8 +634,7 @@ async fn obd_sender_task(
                 if off_time.elapsed().as_secs() < 60 {
                     break;
                 }
-            }
-            else {
+            } else {
                 // Car is on, exit 5-minute timer loop
                 break;
             }
@@ -507,15 +648,18 @@ async fn obd_sender_task(
 async fn bme_sender_task(i2c: i2c::I2c<'static, I2C0, i2c::Async>) {
     let mut bme280 = AsyncBme280::new(i2c, Delay);
     bme280.init().await.unwrap();
-    bme280.set_sampling_configuration(
-        bme280_rs::Configuration::default()
-            .with_sensor_mode(bme280_rs::SensorMode::Normal)
-            .with_standby_time(bme280_rs::StandbyTime::Millis1000)
-            .with_pressure_oversampling(bme280_rs::Oversampling::Oversample8)
-            .with_temperature_oversampling(bme280_rs::Oversampling::Oversample8)
-            .with_humidity_oversampling(bme280_rs::Oversampling::Oversample8)
-            .with_filter(bme280_rs::Filter::Filter4)
-    ).await.unwrap();
+    bme280
+        .set_sampling_configuration(
+            bme280_rs::Configuration::default()
+                .with_sensor_mode(bme280_rs::SensorMode::Normal)
+                .with_standby_time(bme280_rs::StandbyTime::Millis1000)
+                .with_pressure_oversampling(bme280_rs::Oversampling::Oversample8)
+                .with_temperature_oversampling(bme280_rs::Oversampling::Oversample8)
+                .with_humidity_oversampling(bme280_rs::Oversampling::Oversample8)
+                .with_filter(bme280_rs::Filter::Filter4),
+        )
+        .await
+        .unwrap();
 
     fn compensate_temperature(sensor_temp: Temperature) -> Temperature {
         sensor_temp - 6.0
@@ -527,8 +671,10 @@ async fn bme_sender_task(i2c: i2c::I2c<'static, I2C0, i2c::Async>) {
         const TN: f32 = 240.71;
 
         let corrected_temp = compensate_temperature(sensor_temp);
-        let sensor_saturation_vapor_pressure = A * f32::powf(10.0,(M * sensor_temp) / (sensor_temp + TN));
-        let corrected_saturation_vapor_pressure = A * f32::powf(10.0,(M * corrected_temp) / (corrected_temp + TN));
+        let sensor_saturation_vapor_pressure =
+            A * f32::powf(10.0, (M * sensor_temp) / (sensor_temp + TN));
+        let corrected_saturation_vapor_pressure =
+            A * f32::powf(10.0, (M * corrected_temp) / (corrected_temp + TN));
         let vapor_pressure = (sensor_humidity * sensor_saturation_vapor_pressure) / 100.0;
         (vapor_pressure / corrected_saturation_vapor_pressure) * 100.0
     }
@@ -540,12 +686,18 @@ async fn bme_sender_task(i2c: i2c::I2c<'static, I2C0, i2c::Async>) {
         let sample = bme280.read_sample().await.unwrap();
         let pressure = sample.pressure.unwrap_or(0.0).to_be_bytes();
         let temperature = compensate_temperature(sample.temperature.unwrap_or(0.0)).to_be_bytes();
-        let humidity = compensate_humidity(sample.temperature.unwrap_or(0.0), sample.humidity.unwrap_or(0.0)).to_be_bytes();
+        let humidity = compensate_humidity(
+            sample.temperature.unwrap_or(0.0),
+            sample.humidity.unwrap_or(0.0),
+        )
+        .to_be_bytes();
 
         forward_data.extend_from_slice(&pressure).unwrap();
         forward_data.extend_from_slice(&temperature).unwrap();
         forward_data.extend_from_slice(&humidity).unwrap();
-        FORWARDING_CHANNEL.send((StandardId::new(0x7A0).unwrap(), forward_data)).await;
+        FORWARDING_CHANNEL
+            .send((StandardId::new(0x7A0).unwrap(), forward_data))
+            .await;
 
         ticker.next().await;
     }
@@ -564,41 +716,69 @@ async fn comma_task(
     let comma_controller = COMMA_CONTROLLER.init(Mutex::new(MCP25xxFD::new(comma_device)));
     {
         let mut comma_controller = comma_controller.lock().await;
-        comma_controller.reset_and_apply_config(&Config {
-            clock: Clock::Clock20MHz,
-            bit_rate: BitRate::default(),
-            ecc_enabled: true,
-            restrict_retx_attempts: false,
-            txq_enabled: false,
-            tx_event_fifo_enabled: false,
-            iso_crc_enabled: true,
-        }).await.unwrap();
+        comma_controller
+            .reset_and_apply_config(&Config {
+                clock: Clock::Clock20MHz,
+                bit_rate: BitRate::default(),
+                ecc_enabled: true,
+                restrict_retx_attempts: false,
+                txq_enabled: false,
+                tx_event_fifo_enabled: false,
+                iso_crc_enabled: true,
+            })
+            .await
+            .unwrap();
 
-        comma_controller.configure_fifo(
-            FIFOConfig::<TRANSMIT_FIFO>::tx_with_size(8, PayloadSize::Bytes64)
-        ).await.unwrap();
+        comma_controller
+            .configure_fifo(FIFOConfig::<TRANSMIT_FIFO>::tx_with_size(
+                8,
+                PayloadSize::Bytes64,
+            ))
+            .await
+            .unwrap();
 
-        comma_controller.configure_fifo(
-            FIFOConfig::<IGNITION_FIFO>::rx_with_size(32, PayloadSize::Bytes8)
-        ).await.unwrap();
-        comma_controller.configure_filter(
-            FilterConfig::<IGNITION_FIFO, IGNITION_FIFO>::from_id(StandardId::new(0x201).unwrap()),
-            MaskConfig::<IGNITION_FIFO>::match_exact(),
-        ).await.unwrap();
+        comma_controller
+            .configure_fifo(FIFOConfig::<IGNITION_FIFO>::rx_with_size(
+                32,
+                PayloadSize::Bytes8,
+            ))
+            .await
+            .unwrap();
+        comma_controller
+            .configure_filter(
+                FilterConfig::<IGNITION_FIFO, IGNITION_FIFO>::from_id(
+                    StandardId::new(0x201).unwrap(),
+                ),
+                MaskConfig::<IGNITION_FIFO>::match_exact(),
+            )
+            .await
+            .unwrap();
 
-        comma_controller.set_mode(registers::OperationMode::Normal).await.unwrap();
+        comma_controller
+            .set_mode(registers::OperationMode::Normal)
+            .await
+            .unwrap();
         Timer::after_millis(500).await;
     }
-    spawner.must_spawn(comma_car_on_task(comma_controller, int, car_off_since));
+    spawner.spawn(comma_car_on_task(comma_controller, int, car_off_since).unwrap());
 
     loop {
         let (forward_addr, forward_data) = FORWARDING_CHANNEL.receive().await;
         let forward_frame = Frame::new(forward_addr, forward_data.as_slice()).unwrap();
 
-        debug!("Forwarding {} bytes to address {:x}", forward_data.len(), forward_addr.as_raw());
+        debug!(
+            "Forwarding {} bytes to address {:x}",
+            forward_data.len(),
+            forward_addr.as_raw()
+        );
 
-        match comma_controller.lock().await.transmit::<TRANSMIT_FIFO>(&forward_frame).await {
-            Ok(()) => {},
+        match comma_controller
+            .lock()
+            .await
+            .transmit::<TRANSMIT_FIFO>(&forward_frame)
+            .await
+        {
+            Ok(()) => {}
             Err(err) => {
                 error!("Forwarding error: {}", err);
             }
@@ -608,14 +788,22 @@ async fn comma_task(
 
 #[embassy_executor::task]
 async fn comma_car_on_task(
-    comma_controller: &'static Mutex<CriticalSectionRawMutex, MCP25xxFD<SpiDevice<'_, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'_>>>>,
+    comma_controller: &'static Mutex<
+        CriticalSectionRawMutex,
+        MCP25xxFD<SpiDevice<'static, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'static>>>,
+    >,
     mut int: Input<'static>,
     car_off_since: &'static Mutex<CriticalSectionRawMutex, Option<Instant>>,
 ) {
     loop {
         // Wait for interrupt pin to go low (aka active) before calling receive so we don't spinlock
         int.wait_for_low().await;
-        if let Ok(Some(_)) = comma_controller.lock().await.receive(Some(IGNITION_FIFO)).await {
+        if let Ok(Some(_)) = comma_controller
+            .lock()
+            .await
+            .receive(Some(IGNITION_FIFO))
+            .await
+        {
             debug!("Car ignition detected via CAN 0");
             *car_off_since.lock().await = None;
         }
