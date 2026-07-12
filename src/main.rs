@@ -748,7 +748,8 @@ async fn comma_task(
         comma_controller
             .configure_filter(
                 FilterConfig::<IGNITION_FIFO, IGNITION_FIFO>::from_id(
-                    StandardId::new(0x201).unwrap(),
+                    // Front radar ECU that transmits when car is on on MY2025 Ioniq 5 (was 0x201 for MY2024)
+                    StandardId::new(0x216).unwrap(),
                 ),
                 MaskConfig::<IGNITION_FIFO>::match_exact(),
             )
