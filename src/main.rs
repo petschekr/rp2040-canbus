@@ -539,19 +539,20 @@ async fn obd_task(
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x04] => 0x754,
                 addr if addr == rx_addrs.dash && transfer.pid() == [0xB0, 0x02] => 0x760,
                 addr if addr == rx_addrs.igpm && transfer.pid() == [0xBC, 0x03] => {
-                    let car_not_in_parked_state = transfer.data()[5] & (1 << 0) > 0 // Hood open
-                        || transfer.data()[4] & (1 << 0) > 0 // Rear Left door open
-                        || transfer.data()[4] & (1 << 1) > 0 // Rear Left door unlocked
-                        || transfer.data()[4] & (1 << 2) > 0 // Rear Right door open
-                        || transfer.data()[4] & (1 << 3) > 0 // Rear Right door unlocked
-                        || transfer.data()[4] & (1 << 4) > 0 // Passenger door open
-                        || transfer.data()[4] & (1 << 5) > 0 // Driver door open
-                        || transfer.data()[4] & (1 << 7) > 0; // Trunk open
-                    if car_not_in_parked_state {
-                        // Consider car to be on and keep quick polling until all doors closed and locked
-                        let mut car_off_since = car_off_since.lock().await;
-                        *car_off_since = None;
-                    }
+                    info!("FIXME: Wrong IGMP response: {:?}", transfer.data());
+                    // let car_not_in_parked_state = transfer.data()[5] & (1 << 0) > 0 // Hood open
+                    //     || transfer.data()[4] & (1 << 0) > 0 // Rear Left door open
+                    //     || transfer.data()[4] & (1 << 1) > 0 // Rear Left door unlocked
+                    //     || transfer.data()[4] & (1 << 2) > 0 // Rear Right door open
+                    //     || transfer.data()[4] & (1 << 3) > 0 // Rear Right door unlocked
+                    //     || transfer.data()[4] & (1 << 4) > 0 // Passenger door open
+                    //     || transfer.data()[4] & (1 << 5) > 0 // Driver door open
+                    //     || transfer.data()[4] & (1 << 7) > 0; // Trunk open
+                    // if car_not_in_parked_state {
+                    //     // Consider car to be on and keep quick polling until all doors closed and locked
+                    //     let mut car_off_since = car_off_since.lock().await;
+                    //     *car_off_since = None;
+                    // }
                     0x773
                 }
                 addr if addr == rx_addrs.igpm && transfer.pid() == [0xBC, 0x04] => {
