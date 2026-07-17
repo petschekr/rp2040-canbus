@@ -74,7 +74,8 @@ struct ECUAddresses {
     iccu: Id,
     vcms: Id,
     dash: Id,
-    igpm: Id,
+    bdc: Id,
+    vcu: Id,
 }
 impl ECUAddresses {
     fn new() -> (Self, Self) {
@@ -86,7 +87,8 @@ impl ECUAddresses {
             iccu: StandardId::new(0x7E5).unwrap().into(),
             vcms: StandardId::new(0x744).unwrap().into(),
             dash: StandardId::new(0x7C6).unwrap().into(),
-            igpm: StandardId::new(0x770).unwrap().into(),
+            bdc: StandardId::new(0x770).unwrap().into(),
+            vcu: StandardId::new(0x7E2).unwrap().into(),
         };
         let rx = Self {
             bms: Self::rx_address(tx.bms),
@@ -96,7 +98,8 @@ impl ECUAddresses {
             iccu: Self::rx_address(tx.iccu),
             vcms: Self::rx_address(tx.vcms),
             dash: Self::rx_address(tx.dash),
-            igpm: Self::rx_address(tx.igpm),
+            bdc: Self::rx_address(tx.bdc),
+            vcu: Self::rx_address(tx.vcu),
         };
         (tx, rx)
     }
@@ -166,7 +169,8 @@ const RX_ADAS_FIFO: u8 = 5;
 const RX_ICCU_FIFO: u8 = 6;
 const RX_VCMS_FIFO: u8 = 7;
 const RX_DASH_FIFO: u8 = 8;
-const RX_IGPM_FIFO: u8 = 9;
+const RX_BDC_FIFO: u8 = 9;
+const RX_VCU_FIFO: u8 = 10;
 
 #[embassy_executor::task]
 async fn obd_task(
@@ -204,125 +208,34 @@ async fn obd_task(
             .await
             .unwrap();
 
-        obd_controller
-            .configure_fifo(FIFOConfig::<RX_BATTERY_FIFO>::rx_with_size(
-                8,
-                PayloadSize::Bytes8,
-            ))
-            .await
-            .unwrap();
-        obd_controller
-            .configure_filter(
-                FilterConfig::<RX_BATTERY_FIFO, RX_BATTERY_FIFO>::from_id(rx_addrs.bms),
-                MaskConfig::<RX_BATTERY_FIFO>::match_exact(),
-            )
-            .await
-            .unwrap();
+        async fn configure_rx_fifo<'a, const FIFO: u8>(
+            controller: &mut MCP25xxFD<
+                SpiDevice<'a, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'a>>,
+            >,
+            rx_addr: impl Into<Id>,
+        ) {
+            controller
+                .configure_fifo(FIFOConfig::<FIFO>::rx_with_size(8, PayloadSize::Bytes8))
+                .await
+                .unwrap();
+            controller
+                .configure_filter(
+                    FilterConfig::<FIFO, FIFO>::from_id(rx_addr),
+                    MaskConfig::<FIFO>::match_exact(),
+                )
+                .await
+                .unwrap();
+        }
 
-        obd_controller
-            .configure_fifo(FIFOConfig::<RX_TPMS_FIFO>::rx_with_size(
-                8,
-                PayloadSize::Bytes8,
-            ))
-            .await
-            .unwrap();
-        obd_controller
-            .configure_filter(
-                FilterConfig::<RX_TPMS_FIFO, RX_TPMS_FIFO>::from_id(rx_addrs.tpms),
-                MaskConfig::<RX_TPMS_FIFO>::match_exact(),
-            )
-            .await
-            .unwrap();
-
-        obd_controller
-            .configure_fifo(FIFOConfig::<RX_HVAC_FIFO>::rx_with_size(
-                8,
-                PayloadSize::Bytes8,
-            ))
-            .await
-            .unwrap();
-        obd_controller
-            .configure_filter(
-                FilterConfig::<RX_HVAC_FIFO, RX_HVAC_FIFO>::from_id(rx_addrs.hvac),
-                MaskConfig::<RX_HVAC_FIFO>::match_exact(),
-            )
-            .await
-            .unwrap();
-
-        obd_controller
-            .configure_fifo(FIFOConfig::<RX_ADAS_FIFO>::rx_with_size(
-                8,
-                PayloadSize::Bytes8,
-            ))
-            .await
-            .unwrap();
-        obd_controller
-            .configure_filter(
-                FilterConfig::<RX_ADAS_FIFO, RX_ADAS_FIFO>::from_id(rx_addrs.adas),
-                MaskConfig::<RX_ADAS_FIFO>::match_exact(),
-            )
-            .await
-            .unwrap();
-
-        obd_controller
-            .configure_fifo(FIFOConfig::<RX_ICCU_FIFO>::rx_with_size(
-                8,
-                PayloadSize::Bytes8,
-            ))
-            .await
-            .unwrap();
-        obd_controller
-            .configure_filter(
-                FilterConfig::<RX_ICCU_FIFO, RX_ICCU_FIFO>::from_id(rx_addrs.iccu),
-                MaskConfig::<RX_ICCU_FIFO>::match_exact(),
-            )
-            .await
-            .unwrap();
-
-        obd_controller
-            .configure_fifo(FIFOConfig::<RX_VCMS_FIFO>::rx_with_size(
-                8,
-                PayloadSize::Bytes8,
-            ))
-            .await
-            .unwrap();
-        obd_controller
-            .configure_filter(
-                FilterConfig::<RX_VCMS_FIFO, RX_VCMS_FIFO>::from_id(rx_addrs.vcms),
-                MaskConfig::<RX_VCMS_FIFO>::match_exact(),
-            )
-            .await
-            .unwrap();
-
-        obd_controller
-            .configure_fifo(FIFOConfig::<RX_DASH_FIFO>::rx_with_size(
-                8,
-                PayloadSize::Bytes8,
-            ))
-            .await
-            .unwrap();
-        obd_controller
-            .configure_filter(
-                FilterConfig::<RX_DASH_FIFO, RX_DASH_FIFO>::from_id(rx_addrs.dash),
-                MaskConfig::<RX_DASH_FIFO>::match_exact(),
-            )
-            .await
-            .unwrap();
-
-        obd_controller
-            .configure_fifo(FIFOConfig::<RX_IGPM_FIFO>::rx_with_size(
-                8,
-                PayloadSize::Bytes8,
-            ))
-            .await
-            .unwrap();
-        obd_controller
-            .configure_filter(
-                FilterConfig::<RX_IGPM_FIFO, RX_IGPM_FIFO>::from_id(rx_addrs.igpm),
-                MaskConfig::<RX_IGPM_FIFO>::match_exact(),
-            )
-            .await
-            .unwrap();
+        configure_rx_fifo::<RX_BATTERY_FIFO>(&mut obd_controller, rx_addrs.bms).await;
+        configure_rx_fifo::<RX_TPMS_FIFO>(&mut obd_controller, rx_addrs.tpms).await;
+        configure_rx_fifo::<RX_HVAC_FIFO>(&mut obd_controller, rx_addrs.hvac).await;
+        configure_rx_fifo::<RX_ADAS_FIFO>(&mut obd_controller, rx_addrs.adas).await;
+        configure_rx_fifo::<RX_ICCU_FIFO>(&mut obd_controller, rx_addrs.iccu).await;
+        configure_rx_fifo::<RX_VCMS_FIFO>(&mut obd_controller, rx_addrs.vcms).await;
+        configure_rx_fifo::<RX_DASH_FIFO>(&mut obd_controller, rx_addrs.dash).await;
+        configure_rx_fifo::<RX_BDC_FIFO>(&mut obd_controller, rx_addrs.bdc).await;
+        configure_rx_fifo::<RX_VCU_FIFO>(&mut obd_controller, rx_addrs.vcu).await;
 
         obd_controller
             .set_mode(registers::OperationMode::Normal)
@@ -538,8 +451,8 @@ async fn obd_task(
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x03] => 0x753,
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x04] => 0x754,
                 addr if addr == rx_addrs.dash && transfer.pid() == [0xB0, 0x02] => 0x760,
-                addr if addr == rx_addrs.igpm && transfer.pid() == [0xBC, 0x03] => {
-                    info!("FIXME: Wrong IGMP response: {:?}", transfer.data());
+                addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x03] => {
+                    info!("FIXME: Wrong BDC response: {:?}", transfer.data());
                     // let car_not_in_parked_state = transfer.data()[5] & (1 << 0) > 0 // Hood open
                     //     || transfer.data()[4] & (1 << 0) > 0 // Rear Left door open
                     //     || transfer.data()[4] & (1 << 1) > 0 // Rear Left door unlocked
@@ -555,16 +468,18 @@ async fn obd_task(
                     // }
                     0x773
                 }
-                addr if addr == rx_addrs.igpm && transfer.pid() == [0xBC, 0x04] => {
-                    let car_not_in_parked_state = transfer.data()[4] & (1 << 3) > 0 // Driver door unlocked
-                        || transfer.data()[4] & (1 << 2) > 0; // Passenger door unlocked
-                    if car_not_in_parked_state {
-                        // Consider car to be on and keep quick polling until all doors closed and locked
-                        let mut car_off_since = car_off_since.lock().await;
-                        *car_off_since = None;
-                    }
+                addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x04] => {
+                    info!("FIXME: Wrong BDC response: {:?}", transfer.data());
+                    // let car_not_in_parked_state = transfer.data()[4] & (1 << 3) > 0 // Driver door unlocked
+                    //     || transfer.data()[4] & (1 << 2) > 0; // Passenger door unlocked
+                    // if car_not_in_parked_state {
+                    //     // Consider car to be on and keep quick polling until all doors closed and locked
+                    //     let mut car_off_since = car_off_since.lock().await;
+                    //     *car_off_since = None;
+                    // }
                     0x774
                 }
+                addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x06] => 0x776,
                 _ => {
                     warn!(
                         "Unhandled ISO-TP response from address {:x} to PID {:x}: {:x}",
@@ -612,8 +527,9 @@ async fn obd_sender_task(
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x04])).unwrap(),
         Frame::new(tx_addrs.dash, &construct_uds_query(&[0xB0, 0x02])).unwrap(),
-        Frame::new(tx_addrs.igpm, &construct_uds_query(&[0xBC, 0x03])).unwrap(),
-        Frame::new(tx_addrs.igpm, &construct_uds_query(&[0xBC, 0x04])).unwrap(),
+        // Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x03])).unwrap(),
+        // Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x04])).unwrap(),
+        Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x06])).unwrap(),
     ];
 
     let mut ticker = Ticker::every(Duration::from_secs(1));
