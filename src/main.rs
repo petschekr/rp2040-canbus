@@ -445,7 +445,7 @@ async fn obd_task(
                 addr if addr == rx_addrs.iccu && transfer.pid() == [0xE0, 0x01] => 0x741,
                 addr if addr == rx_addrs.iccu && transfer.pid() == [0xE0, 0x02] => 0x742,
                 addr if addr == rx_addrs.iccu && transfer.pid() == [0xE0, 0x03] => 0x743,
-                addr if addr == rx_addrs.iccu && transfer.pid() == [0xE0, 0x11] => 0x74B,
+                addr if addr == rx_addrs.iccu && transfer.pid() == [0xE1, 0x01] => 0x74B,
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x01] => 0x751,
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x02] => 0x752,
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x03] => 0x753,
@@ -521,7 +521,7 @@ async fn obd_sender_task(
         Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x01])).unwrap(),
         Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x02])).unwrap(),
         Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
-        Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x11])).unwrap(),
+        Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE1, 0x01])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x01])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x02])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
@@ -530,6 +530,7 @@ async fn obd_sender_task(
         // Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x03])).unwrap(),
         // Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x04])).unwrap(),
         Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x06])).unwrap(),
+        // Frame::new(tx_addrs.vcu, &construct_uds_query(&[0xBC, 0x06])).unwrap(), // Command bytes are wrong 0x21, 0x01??
     ];
 
     let mut ticker = Ticker::every(Duration::from_secs(1));
