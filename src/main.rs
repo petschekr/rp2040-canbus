@@ -192,7 +192,7 @@ async fn obd_task(
                 clock: Clock::Clock20MHz,
                 bit_rate: BitRate::default(),
                 ecc_enabled: true,
-                restrict_retx_attempts: false,
+                restrict_retx_attempts: true,
                 txq_enabled: false,
                 tx_event_fifo_enabled: false,
                 iso_crc_enabled: true,
@@ -202,7 +202,7 @@ async fn obd_task(
 
         obd_controller
             .configure_fifo(FIFOConfig::<TRANSMIT_FIFO>::tx_with_size(
-                8,
+                32,
                 PayloadSize::Bytes8,
             ))
             .await
@@ -536,12 +536,19 @@ async fn obd_sender_task(
     let mut ticker = Ticker::every(Duration::from_secs(1));
     loop {
         for frame in queries.iter() {
-            obd_controller
-                .lock()
-                .await
-                .transmit::<TRANSMIT_FIFO>(frame)
-                .await
-                .unwrap();
+            let mut obd_controller = obd_controller.lock().await;
+
+            match obd_controller.transmit::<TRANSMIT_FIFO>(frame).await {
+                Ok(_) => {}
+                Err(mcp25xxfd::Error::ControllerError(err)) => {
+                    error!("OBD CAN controller error: {}", err);
+                    // The only reason we would get a controller error is if the TX FIFO is full
+                    // So reset the TX FIFO before sending again
+                    debug!("TX FIFO reset...");
+                    obd_controller.reset_fifo::<TRANSMIT_FIFO>().await.unwrap();
+                }
+                Err(err) => error!("OBD CAN SPI error: {}", err),
+            }
             Timer::after_millis(30).await;
         }
         // Wait 5 minutes between polls if car is off to allow ECUs to deep sleep and save battery
@@ -639,7 +646,7 @@ async fn comma_task(
                 clock: Clock::Clock20MHz,
                 bit_rate: BitRate::default(),
                 ecc_enabled: true,
-                restrict_retx_attempts: false,
+                restrict_retx_attempts: true,
                 txq_enabled: false,
                 tx_event_fifo_enabled: false,
                 iso_crc_enabled: true,
@@ -649,7 +656,7 @@ async fn comma_task(
 
         comma_controller
             .configure_fifo(FIFOConfig::<TRANSMIT_FIFO>::tx_with_size(
-                8,
+                16,
                 PayloadSize::Bytes64,
             ))
             .await
