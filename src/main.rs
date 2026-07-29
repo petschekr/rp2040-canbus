@@ -269,6 +269,9 @@ async fn obd_task(
         fn data(&self) -> &[u8] {
             &self.raw_data[3..]
         }
+        fn raw_tx_addr(&self) -> u32 {
+            self.raw_rx_addr() - 8
+        }
         fn raw_rx_addr(&self) -> u32 {
             match self.rx_addr {
                 Id::Standard(id) => id.as_raw() as u32,
@@ -370,6 +373,11 @@ async fn obd_task(
 
                                     if transfer.raw_data.len() as u16 >= transfer.length {
                                         // ISO-TP transmission complete
+                                        trace!(
+                                            "Frame sequence complete {:x} -> {:x}",
+                                            transfer.raw_tx_addr(),
+                                            transfer.raw_rx_addr()
+                                        );
                                         break;
                                     }
                                 }
@@ -451,8 +459,12 @@ async fn obd_task(
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x03] => 0x753,
                 addr if addr == rx_addrs.vcms && transfer.pid() == [0xE0, 0x04] => 0x754,
                 addr if addr == rx_addrs.dash && transfer.pid() == [0xB0, 0x02] => 0x760,
+                addr if addr == rx_addrs.dash && transfer.pid() == [0x22, 0x78] => {
+                    // Phantom PID that gets emitted in the format [0x7F, 0x22, 0x78] before the actual dash/cluster response
+                    0x761
+                }
                 addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x03] => {
-                    info!("FIXME: Wrong BDC response: {:?}", transfer.data());
+                    info!("FIXME: Wrong BDC response: {:x}", transfer.data());
                     // let car_not_in_parked_state = transfer.data()[5] & (1 << 0) > 0 // Hood open
                     //     || transfer.data()[4] & (1 << 0) > 0 // Rear Left door open
                     //     || transfer.data()[4] & (1 << 1) > 0 // Rear Left door unlocked
@@ -469,7 +481,7 @@ async fn obd_task(
                     0x773
                 }
                 addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x04] => {
-                    info!("FIXME: Wrong BDC response: {:?}", transfer.data());
+                    info!("FIXME: Wrong BDC response: {:x}", transfer.data());
                     // let car_not_in_parked_state = transfer.data()[4] & (1 << 3) > 0 // Driver door unlocked
                     //     || transfer.data()[4] & (1 << 2) > 0; // Passenger door unlocked
                     // if car_not_in_parked_state {
@@ -482,10 +494,12 @@ async fn obd_task(
                 addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x06] => 0x776,
                 _ => {
                     warn!(
-                        "Unhandled ISO-TP response from address {:x} to PID {:x}: {:x}",
+                        "Unhandled ISO-TP response from address {:x} -> {:x} to PID {:x}: {:x}\nFull raw data: {:x}",
+                        transfer.raw_tx_addr(),
                         transfer.raw_rx_addr(),
                         transfer.pid(),
-                        transfer.data()
+                        transfer.data(),
+                        transfer.raw_data,
                     );
                     continue;
                 }
