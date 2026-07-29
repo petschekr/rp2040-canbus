@@ -136,7 +136,7 @@ async fn main(spawner: Spawner) {
     let mut comma_stby = Output::new(p.PIN_25, Level::Low);
     comma_stby.set_high();
 
-    spawner.spawn(obd_task(spi0, obd_cs, obd_int).unwrap());
+    spawner.spawn(obd_task(spawner, spi0, obd_cs, obd_int).unwrap());
 }
 
 const TX_FIFO: u8 = 1;
@@ -144,6 +144,7 @@ const RX_FIFO: u8 = 2;
 
 #[embassy_executor::task]
 async fn obd_task(
+    spawner: Spawner,
     spi_bus: &'static Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>,
     cs: Output<'static>,
     mut int: Input<'static>,
@@ -191,6 +192,7 @@ async fn obd_task(
             .unwrap();
         Timer::after_millis(500).await;
     }
+    spawner.spawn(obd_sender_task(obd_controller, tx_addrs).unwrap());
 
     #[derive(Format)]
     struct ISOTPTransfer {
@@ -224,14 +226,13 @@ async fn obd_task(
         }
     }
 
-    // Permalocks the mutex, remove if needed elsewhere for tx
-    let mut obd_controller = obd_controller.lock().await;
     // Receive loop
     loop {
         // Wait for interrupt pin to go low (aka active) before calling receive so we don't spinlock
         int.wait_for_low().await;
-
+        let mut obd_controller = obd_controller.lock().await;
         let mut transfer: Option<ISOTPTransfer> = None;
+
         loop {
             match obd_controller.receive(None).await {
                 Ok(Some((fifo, frame))) => {
@@ -349,4 +350,27 @@ async fn obd_task(
             }
         }
     }
+}
+
+#[embassy_executor::task]
+async fn obd_sender_task(
+    obd_controller: &'static Mutex<
+        CriticalSectionRawMutex,
+        MCP25xxFD<SpiDevice<'static, CriticalSectionRawMutex, SPI0Type<SPI0>, Output<'static>>>,
+    >,
+    tx_addrs: ECUAddresses,
+) {
+    let query: [u8; 8] = [0x03, 0x2c, 0x01, 0xF2, 0x01, 0x00, 0x00, 0x00];
+    // let query: [u8; 8] = [0x03, 0x2a, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00];
+
+    let frame = Frame::new(tx_addrs.bms, &query).unwrap();
+
+    obd_controller
+        .lock()
+        .await
+        .transmit::<TX_FIFO>(&frame)
+        .await
+        .unwrap();
+
+    debug!("Sent!");
 }
