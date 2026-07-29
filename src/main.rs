@@ -550,18 +550,20 @@ async fn obd_sender_task(
     let mut ticker = Ticker::every(Duration::from_secs(1));
     loop {
         for frame in queries.iter() {
-            let mut obd_controller = obd_controller.lock().await;
+            {
+                let mut obd_controller = obd_controller.lock().await;
 
-            match obd_controller.transmit::<TRANSMIT_FIFO>(frame).await {
-                Ok(_) => {}
-                Err(mcp25xxfd::Error::ControllerError(err)) => {
-                    error!("OBD CAN controller error: {}", err);
-                    // The only reason we would get a controller error is if the TX FIFO is full
-                    // So reset the TX FIFO before sending again
-                    debug!("TX FIFO reset...");
-                    obd_controller.reset_fifo::<TRANSMIT_FIFO>().await.unwrap();
+                match obd_controller.transmit::<TRANSMIT_FIFO>(frame).await {
+                    Ok(_) => {}
+                    Err(mcp25xxfd::Error::ControllerError(err)) => {
+                        error!("OBD CAN controller error: {}", err);
+                        // The only reason we would get a controller error is if the TX FIFO is full
+                        // So reset the TX FIFO before sending again
+                        debug!("TX FIFO reset...");
+                        obd_controller.reset_fifo::<TRANSMIT_FIFO>().await.unwrap();
+                    }
+                    Err(err) => error!("OBD CAN SPI error: {}", err),
                 }
-                Err(err) => error!("OBD CAN SPI error: {}", err),
             }
             Timer::after_millis(30).await;
         }
