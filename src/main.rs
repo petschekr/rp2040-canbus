@@ -335,12 +335,41 @@ async fn obd_task(
             if transfer.data().iter().all(|&x| x == 0x00 || x == 0xaa) {
                 continue;
             }
+            let name = match transfer.raw_rx_addr() - 8 {
+                0x702 | 0x715 => "Door Handle Control",
+                0x705 => "Mood Lamp",
+                0x706 => "Seat Control",
+                0x707 => "SHVU_RR",
+                0x716 => "MKBD",
+                0x725 => "Wireless Phone Charger",
+                0x730 => "ADAS Driving",
+                0x733 => "VCMS/Charge Management",
+                0x736 => "VESS",
+                0x744 => "VCMS",
+                0x770 => "BCM",
+                0x777 => "Power Tailgate",
+                0x780 => "Headunit",
+                0x783 => "Amp",
+                0x7A0 => "TPMS (Integrated Body Unit)",
+                0x7A6 => "Multifunction Stalk",
+                0x7A7 => "Steering Wheel",
+                0x7B1 => "ADAS Parking",
+                0x7B3 => "HVAC",
+                0x7B5 => "ICC",
+                0x7B6 => "Shifter",
+                0x7C4 => "Front Camera",
+                0x7C6 => "CLU/DASH",
+                0x7E2 => "VCU",
+                0x7E4 => "BMS",
+                0x7E5 => "ICCU",
+                _ => "Unknown",
+            };
             info!(
-                "ISO-TP: {:x} -> {:x} -> {:02x}: {:x}",
+                "ISO-TP: {} ({:x}) -> {:02x}",
+                name,
                 transfer.raw_rx_addr() - 8,
-                transfer.raw_rx_addr(),
                 transfer.pid(),
-                transfer.data()
+                // transfer.data()
             );
             match transfer.rx_addr {
                 x if x == rx_addrs.dash => {
@@ -360,17 +389,16 @@ async fn obd_sender_task(
     >,
     tx_addrs: ECUAddresses,
 ) {
-    let query: [u8; 8] = [0x03, 0x2c, 0x01, 0xF2, 0x01, 0x00, 0x00, 0x00];
     // let query: [u8; 8] = [0x03, 0x2a, 0x03, 0x01, 0x00, 0x00, 0x00, 0x00];
 
-    let frame = Frame::new(tx_addrs.bms, &query).unwrap();
+    // let frame = Frame::new(tx_addrs.bms, &query).unwrap();
 
-    obd_controller
-        .lock()
-        .await
-        .transmit::<TX_FIFO>(&frame)
-        .await
-        .unwrap();
+    // obd_controller
+    //     .lock()
+    //     .await
+    //     .transmit::<TX_FIFO>(&frame)
+    //     .await
+    //     .unwrap();
 
-    debug!("Sent!");
+    // debug!("Sent!");
 }

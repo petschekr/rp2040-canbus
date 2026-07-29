@@ -507,6 +507,9 @@ pub struct Dashboard {
 }
 impl Process for Dashboard {
     fn process(data: &[u8]) -> Option<Data> {
+        if data.len() < 12 {
+            return None;
+        }
         Some(Data::Dashboard(Self {
             odometer: ((data[9] as u32) << 16) + ((data[10] as u32) << 8) + (data[11] as u32),
         }))
