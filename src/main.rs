@@ -542,7 +542,7 @@ async fn obd_sender_task(
         // Frame::new(tx_addrs.vcu, &construct_uds_query(&[0xBC, 0x06])).unwrap(), // Command bytes are wrong 0x21, 0x01??
     ];
 
-    let mut ticker = Ticker::every(Duration::from_secs(1));
+    let mut ticker = Ticker::every(Duration::from_millis(500));
     loop {
         for frame in queries.iter() {
             {
