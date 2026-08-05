@@ -463,35 +463,30 @@ async fn obd_task(
                     // Phantom PID that gets emitted in the format [0x7F, 0x22, 0x78] before the actual dash/cluster response
                     0x761
                 }
-                addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x03] => {
-                    info!("FIXME: Wrong BDC response: {:x}", transfer.data());
-                    // let car_not_in_parked_state = transfer.data()[5] & (1 << 0) > 0 // Hood open
-                    //     || transfer.data()[4] & (1 << 0) > 0 // Rear Left door open
-                    //     || transfer.data()[4] & (1 << 1) > 0 // Rear Left door unlocked
-                    //     || transfer.data()[4] & (1 << 2) > 0 // Rear Right door open
-                    //     || transfer.data()[4] & (1 << 3) > 0 // Rear Right door unlocked
-                    //     || transfer.data()[4] & (1 << 4) > 0 // Passenger door open
-                    //     || transfer.data()[4] & (1 << 5) > 0 // Driver door open
-                    //     || transfer.data()[4] & (1 << 7) > 0; // Trunk open
-                    // if car_not_in_parked_state {
-                    //     // Consider car to be on and keep quick polling until all doors closed and locked
-                    //     let mut car_off_since = car_off_since.lock().await;
-                    //     *car_off_since = None;
-                    // }
+                addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x13] => {
+                    // Byte 4 is 0x00 when locked
+                    if transfer.data()[4] != 0x00 {
+                        // Consider car to be on and keep quick polling until all doors closed and locked
+                        car_off_since.lock().await.take();
+                    }
+
                     0x773
                 }
-                addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x04] => {
-                    info!("FIXME: Wrong BDC response: {:x}", transfer.data());
-                    // let car_not_in_parked_state = transfer.data()[4] & (1 << 3) > 0 // Driver door unlocked
-                    //     || transfer.data()[4] & (1 << 2) > 0; // Passenger door unlocked
-                    // if car_not_in_parked_state {
-                    //     // Consider car to be on and keep quick polling until all doors closed and locked
-                    //     let mut car_off_since = car_off_since.lock().await;
-                    //     *car_off_since = None;
-                    // }
-                    0x774
+                addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x15] => {
+                    let door_open = transfer.data()[4] & (1 << 5) > 0 // Driver door open
+                        || transfer.data()[4] & (1 << 6) > 0 // Passenger door open
+                        || transfer.data()[4] & (1 << 7) > 0 // Rear left door open
+                        || transfer.data()[5] & (1 << 0) > 0 // Rear right door open
+                        || transfer.data()[5] & (1 << 1) > 0 // Hood open
+                        || transfer.data()[4] & (1 << 4) > 0; // Trunk open
+                    if door_open {
+                        // Consider car to be on and keep quick polling until all doors closed and locked
+                        car_off_since.lock().await.take();
+                    }
+
+                    0x775
                 }
-                addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x06] => 0x776,
+                addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x17] => 0x777,
                 _ => {
                     warn!(
                         "Unhandled ISO-TP response from address {:x} -> {:x} to PID {:x}: {:x}\nFull raw data: {:x}",
@@ -527,23 +522,23 @@ async fn obd_sender_task(
     let queries = [
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x01])).unwrap(),
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x05])).unwrap(),
-        // Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x06])).unwrap(),
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x11])).unwrap(),
         Frame::new(tx_addrs.tpms, &construct_uds_query(&[0xC0, 0x0B])).unwrap(),
         Frame::new(tx_addrs.hvac, &construct_uds_query(&[0x01, 0x00])).unwrap(),
-        // Frame::new(tx_addrs.adas, &construct_uds_query(&[0xF0, 0x10])).unwrap(),
-        Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x01])).unwrap(),
-        Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x02])).unwrap(),
-        Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
         Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE1, 0x01])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x01])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x02])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x04])).unwrap(),
         Frame::new(tx_addrs.dash, &construct_uds_query(&[0xB0, 0x02])).unwrap(),
-        // Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x03])).unwrap(),
-        // Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x04])).unwrap(),
-        Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x06])).unwrap(),
+        Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x13])).unwrap(),
+        Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x15])).unwrap(),
+        Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x17])).unwrap(),
+        // Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x06])).unwrap(), // No useful values
+        // Frame::new(tx_addrs.adas, &construct_uds_query(&[0xF0, 0x10])).unwrap(), // No useful values (steering wheel?, g-forces?)
+        // Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x01])).unwrap(), // Doesn't work on MY2025
+        // Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x02])).unwrap(), // Doesn't work on MY2025
+        // Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x03])).unwrap(), // Doesn't work on MY2025
         // Frame::new(tx_addrs.vcu, &construct_uds_query(&[0xBC, 0x06])).unwrap(), // Command bytes are wrong 0x21, 0x01??
     ];
 
