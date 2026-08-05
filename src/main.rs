@@ -32,6 +32,7 @@ static SPI_BUS0: StaticCell<Mutex<CriticalSectionRawMutex, SPI0Type<SPI0>>> = St
 
 static FORWARDING_CHANNEL: Channel<CriticalSectionRawMutex, (StandardId, Vec<u8, 64>), 10> =
     Channel::new();
+static RESPONSE_COMPLETE_CHANNEL: Channel<CriticalSectionRawMutex, StandardId, 10> = Channel::new();
 
 static OBD_CONTROLLER: StaticCell<
     Mutex<
@@ -506,6 +507,9 @@ async fn obd_task(
                     Vec::from_slice(&transfer.data().chunks(64).next().unwrap()).unwrap(),
                 ))
                 .await;
+            RESPONSE_COMPLETE_CHANNEL
+                .send(StandardId::new(transfer.raw_tx_addr() as u16).unwrap())
+                .await;
         }
     }
 }
@@ -522,18 +526,23 @@ async fn obd_sender_task(
     let queries = [
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x01])).unwrap(),
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x05])).unwrap(),
+        Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x17])).unwrap(), // Brake light
         Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x11])).unwrap(),
         Frame::new(tx_addrs.tpms, &construct_uds_query(&[0xC0, 0x0B])).unwrap(),
         Frame::new(tx_addrs.hvac, &construct_uds_query(&[0x01, 0x00])).unwrap(),
+        Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x17])).unwrap(), // Brake light
         Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE1, 0x01])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x01])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x02])).unwrap(),
+        Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x17])).unwrap(), // Brake light
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x04])).unwrap(),
         Frame::new(tx_addrs.dash, &construct_uds_query(&[0xB0, 0x02])).unwrap(),
         Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x13])).unwrap(),
         Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x15])).unwrap(),
-        Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x17])).unwrap(),
+        // Querying brake light after these 2 BDC requests fails to return anything
+        // Query it earlier and more often than once per cycle above inbetween other queries
+
         // Frame::new(tx_addrs.bms, &construct_uds_query(&[0x01, 0x06])).unwrap(), // No useful values
         // Frame::new(tx_addrs.adas, &construct_uds_query(&[0xF0, 0x10])).unwrap(), // No useful values (steering wheel?, g-forces?)
         // Frame::new(tx_addrs.iccu, &construct_uds_query(&[0xE0, 0x01])).unwrap(), // Doesn't work on MY2025
@@ -549,7 +558,9 @@ async fn obd_sender_task(
                 let mut obd_controller = obd_controller.lock().await;
 
                 match obd_controller.transmit::<TRANSMIT_FIFO>(frame).await {
-                    Ok(_) => {}
+                    Ok(_) => {
+                        debug!("Sent to {:x}", frame.raw_id());
+                    }
                     Err(mcp25xxfd::Error::ControllerError(err)) => {
                         error!("OBD CAN controller error: {}", err);
                         // The only reason we would get a controller error is if the TX FIFO is full
@@ -560,7 +571,11 @@ async fn obd_sender_task(
                     Err(err) => error!("OBD CAN SPI error: {}", err),
                 }
             }
-            Timer::after_millis(30).await;
+            let response = RESPONSE_COMPLETE_CHANNEL.receive();
+            match embassy_time::with_timeout(Duration::from_millis(250), response).await {
+                Ok(id) => trace!("Received response from {:x}", id.as_raw()),
+                Err(_) => warn!("Response timed out but continuing anyway"),
+            }
         }
         // Wait 5 minutes between polls if car is off to allow ECUs to deep sleep and save battery
         // Check once per second while waiting to see if car is on again
