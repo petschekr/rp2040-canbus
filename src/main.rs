@@ -718,22 +718,33 @@ async fn comma_task(
         let (forward_addr, forward_data) = FORWARDING_CHANNEL.receive().await;
         let forward_frame = Frame::new(forward_addr, forward_data.as_slice()).unwrap();
 
-        debug!(
-            "Forwarding {} bytes to address {:x}",
-            forward_data.len(),
-            forward_addr.as_raw()
-        );
-
         match comma_controller
             .lock()
             .await
             .transmit::<TRANSMIT_FIFO>(&forward_frame)
             .await
         {
-            Ok(()) => {}
-            Err(err) => {
-                error!("Forwarding error: {}", err);
+            Ok(_) => {
+                debug!(
+                    "Forwarded {} bytes to address {:x}",
+                    forward_data.len(),
+                    forward_addr.as_raw()
+                );
             }
+            Err(mcp25xxfd::Error::ControllerError(err)) => {
+                error!("Forwarding CAN controller error: {}", err);
+                // The only reason we would get a controller error is if the TX FIFO is full
+                // So reset the TX FIFO before sending again
+                // This happens when the Comma/Panda is offline and is not ACKing our messages on the bus
+                debug!("Forwarding TX FIFO reset...");
+                comma_controller
+                    .lock()
+                    .await
+                    .reset_fifo::<TRANSMIT_FIFO>()
+                    .await
+                    .unwrap();
+            }
+            Err(err) => error!("Forwarding CAN SPI error: {}", err),
         }
     }
 }
