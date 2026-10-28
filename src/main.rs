@@ -574,7 +574,10 @@ async fn obd_sender_task(
             let response = RESPONSE_COMPLETE_CHANNEL.receive();
             match embassy_time::with_timeout(Duration::from_millis(250), response).await {
                 Ok(id) => trace!("Received response from {:x}", id.as_raw()),
-                Err(_) => warn!("Response timed out but continuing anyway"),
+                Err(_) => warn!(
+                    "Response timed out from {:x} but continuing anyway",
+                    frame.raw_id()
+                ),
             }
         }
         // Wait 5 minutes between polls if car is off to allow ECUs to deep sleep and save battery
@@ -718,9 +721,9 @@ async fn comma_task(
         let (forward_addr, forward_data) = FORWARDING_CHANNEL.receive().await;
         let forward_frame = Frame::new(forward_addr, forward_data.as_slice()).unwrap();
 
+        let mut comma_controller = comma_controller.lock().await;
+
         match comma_controller
-            .lock()
-            .await
             .transmit::<TRANSMIT_FIFO>(&forward_frame)
             .await
         {
@@ -738,8 +741,6 @@ async fn comma_task(
                 // This happens when the Comma/Panda is offline and is not ACKing our messages on the bus
                 debug!("Forwarding TX FIFO reset...");
                 comma_controller
-                    .lock()
-                    .await
                     .reset_fifo::<TRANSMIT_FIFO>()
                     .await
                     .unwrap();
