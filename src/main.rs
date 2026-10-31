@@ -464,6 +464,7 @@ async fn obd_task(
                     // Phantom PID that gets emitted in the format [0x7F, 0x22, 0x78] before the actual dash/cluster response
                     0x761
                 }
+                addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x03] => 0x772,
                 addr if addr == rx_addrs.bdc && transfer.pid() == [0xBC, 0x13] => {
                     // Byte 4 is 0x00 when locked
                     if transfer.data()[4] != 0x00 {
@@ -538,6 +539,7 @@ async fn obd_sender_task(
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x03])).unwrap(),
         Frame::new(tx_addrs.vcms, &construct_uds_query(&[0xE0, 0x04])).unwrap(),
         Frame::new(tx_addrs.dash, &construct_uds_query(&[0xB0, 0x02])).unwrap(),
+        Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x03])).unwrap(),
         Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x13])).unwrap(),
         Frame::new(tx_addrs.bdc, &construct_uds_query(&[0xBC, 0x15])).unwrap(),
         // Querying brake light after these 2 BDC requests fails to return anything
